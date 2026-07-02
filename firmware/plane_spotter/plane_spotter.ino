@@ -126,7 +126,9 @@ bool     firstFetchDone   = false;
 bool     firstWeatherDone = false;
 
 const uint8_t  NUM_SCREENS    = 5;
-const uint32_t SCREEN_SWAP_MS = 7000;
+// Per-screen dwell time (ms), indexed by `screen`:
+//   0 TARGET  1 INTEL  2 RADAR  3 WX  4 SYSTEM
+const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = { 12000, 12000, 12000, 7000, 7000 };
 
 // ---------------------------------------------------------------------------
 // Geo helpers
@@ -1109,7 +1111,7 @@ void loop() {
     firstWeatherDone = true;
   }
 
-  if (now - lastScreenSwap >= SCREEN_SWAP_MS) {
+  if (now - lastScreenSwap >= SCREEN_SWAP_MS[screen]) {
     screen = (screen + 1) % NUM_SCREENS;
     lastScreenSwap = now;
   }
