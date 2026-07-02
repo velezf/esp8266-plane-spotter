@@ -863,7 +863,7 @@ void screenDetails() {
   u8g2.drawStr(0, 61, line);
 }
 
-// North-up radar (PPI). Home at the centre, range rings (outer = 120 km), a
+// North-up radar (PPI). Home at the centre, range rings (outer = 30 km), a
 // rotating sweep, and a blip per aircraft. Blips are dead-reckoned from their
 // last track+speed so they creep in real time between data refreshes, and use
 // radar persistence: bright just after the sweep passes, then a faint dot.
@@ -871,7 +871,9 @@ void screenRadar() {
   drawHeader("RADAR");
 
   const int cx = 31, cy = 37, R = 23;
-  const float MAX_KM = 120.0f;
+  // Outer ring range. Match this to the search box (SEARCH_RADIUS_DEG): the box
+  // corner is ~sqrt(2)*radius*111 km, so a 0.2 deg box maxes out near 28 km.
+  const float MAX_KM = 30.0f;
   float elapsed = (millis() - lastDataMs) / 1000.0f;   // s since last fetch
 
   // rings + axes
