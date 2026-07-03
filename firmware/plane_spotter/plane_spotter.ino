@@ -38,15 +38,28 @@
 #include "config.h"
 
 // ---------------------------------------------------------------------------
-// Display: SSD1306 128x64, 4-wire hardware SPI.
-// HW SPI uses the fixed ESP8266 pins SCLK=GPIO14 (D5) and MOSI=GPIO13 (D7);
-// only CS / DC / RESET are configurable here.
+// Display: SSD1306 128x64. Two builds selectable with DISPLAY_I2C:
+//   0 = 4-wire hardware SPI (default, 7-pin panel). HW SPI uses the fixed
+//       ESP8266 pins SCLK=GPIO14 (D5) and MOSI=GPIO13 (D7); only CS / DC /
+//       RESET are configurable here.
+//   1 = hardware I2C (fallback for a 4-pin panel). Uses the ESP8266 default
+//       Wire pins SDA=GPIO4 (D2) and SCL=GPIO5 (D1); wire VCC/GND as usual and
+//       leave RES/DC/CS unconnected. If the screen stays blank, the other
+//       common I2C address is 0x78 -> add u8g2.setI2CAddress(0x78) in setup().
+// Everything below the constructor is bus-agnostic U8g2 API, so only this line
+// changes between the two builds.
 // ---------------------------------------------------------------------------
+#define DISPLAY_I2C 0   // flip to 1 and reflash if you swap in an I2C panel
+
 #define OLED_CS   PIN_OLED_CS
 #define OLED_DC   PIN_OLED_DC
 #define OLED_RST  PIN_OLED_RST
 
+#if DISPLAY_I2C
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/ U8X8_PIN_NONE);
+#else
 U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0, OLED_CS, OLED_DC, OLED_RST);
+#endif
 
 // ---------------------------------------------------------------------------
 // Data model

@@ -74,6 +74,34 @@ configurable in `config.h`.
 > The default pins avoid the ESP8266 boot-strapping pins (GPIO0/2/15), so the
 > board flashes and boots reliably.
 
+#### Using an I²C panel instead
+
+If you only have (or prefer) a **4-pin I²C** SSD1306, flip `#define DISPLAY_I2C 0`
+to `1` in `plane_spotter.ino` and reflash. It's the only code change — the sketch
+switches to hardware I²C on the ESP8266 default `Wire` pins, and `RES/DC/CS` are
+unused. Only four wires:
+
+| OLED pin | ESP8266 (NodeMCU label / GPIO) | Role |
+|----------|-------------------------------|------|
+| GND | GND | Ground |
+| VCC | 3V3 | Power |
+| SCL | **D1 / GPIO5** | I²C clock |
+| SDA | **D2 / GPIO4** | I²C data |
+
+```
+        ESP8266 (NodeMCU)                OLED SSD1306 I²C
+      ┌───────────────────┐            ┌──────────────────┐
+      │ 3V3 ──────────────┼────────────┤ VCC              │
+      │ GND ──────────────┼────────────┤ GND              │
+      │ D1/GPIO5 ─────────┼────────────┤ SCL              │
+      │ D2/GPIO4 ─────────┼────────────┤ SDA              │
+      └───────────────────┘            └──────────────────┘
+```
+
+> Pin order varies between panels (`GND VCC SCL SDA` vs `VCC GND SCL SDA`) — match
+> the silkscreen labels, not the position. If the screen stays blank, add
+> `u8g2.setI2CAddress(0x78)` in `setup()` for the alternate address.
+
 ### 3D-printed case
 
 A simple two-part desktop case lives in [`hardware/`](hardware/):
