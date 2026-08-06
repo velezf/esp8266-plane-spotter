@@ -138,6 +138,28 @@ under 120 km/h when OpenSky omits the category, so slow traffic would latch
 immediately. Detecting faster means changing the input (poll harder, or
 discriminate on track swing rather than displacement), not lowering the number.
 
+### Buzzer
+
+A passive piezo on `PIN_BUZZER` (D6/GPIO12) chirps for rotorcraft only. Three
+distinguishable voices: a tick as the radar sweep crosses a contact, a two-tone
+on acquisition, a lower insistent triple on loiter latch. All gated on
+`BUZZER_RANGE_KM`, and suppressed during quiet hours — which fall *open*
+(audible) until NTP syncs, so a clock that never sets cannot silence it.
+
+Everything is non-blocking. `tone()` is timer-driven and returns immediately;
+multi-chirp patterns are sequenced by `buzzerService()` scheduling the next
+chirp from `loop()`. Never add `delay()` here — it would stutter the 30 fps
+sweep. A pattern in flight is not interrupted, so a sweep tick cannot stomp the
+tail of a loiter alert.
+
+The pin choice is constrained, not arbitrary: GPIO16 (D0) is off the normal
+GPIO mux and cannot do `tone()`; GPIO0/GPIO2 must be HIGH at boot and a piezo
+coil dragging them down prevents booting; GPIO15 must be LOW at boot. GPIO12 is
+free in both display builds.
+
+`BUZZER_ENABLE` and `BUZZER_SWEEP_BLIP` are independent compile-time switches —
+check all four combinations build when touching this code.
+
 ### Type icons
 
 OpenSky's emitter category (state index 17, needs `extended=1`) is usually `0` in

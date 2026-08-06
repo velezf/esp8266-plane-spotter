@@ -72,6 +72,47 @@
 #define LOITER_MIN_MS     120000   // 2 min (= 2 polls at the default 60 s)
 #define HELI_EXPIRE_MS    300000   // 5 min
 
+// ---- Piezo buzzer (rotorcraft alerts) ------------------------------------
+// Passive buzzer -- it has no oscillator of its own, so the firmware drives it
+// with tone(). 3-pin module: VCC->3V3, GND->GND, S/IO->PIN_BUZZER. Bare 2-pin
+// element: one leg to PIN_BUZZER, the other to GND, and set BUZZER_ACTIVE_LOW
+// to 0. For a bare element a ~100 ohm series resistor is cheap insurance --
+// ESP8266 pins are only good for ~12 mA; transistor modules drive their own
+// current from VCC and do not need it.
+//
+// D6/GPIO12 is the right pin here and the alternatives mostly are not:
+// GPIO16 (D0) is not on the normal GPIO mux and cannot do tone(); GPIO0 (D3)
+// and GPIO2 (D4) must be HIGH at boot and a buzzer coil dragging them down
+// stops the board booting; GPIO15 (D8) must be LOW at boot. GPIO12 has no
+// strapping role and is free in both the I2C and SPI display builds.
+#define PIN_BUZZER  12   // D6
+
+// Master switch. 0 compiles the buzzer out entirely.
+#define BUZZER_ENABLE  1
+
+// Drive polarity. 3-pin modules built around an S9012 (a PNP transistor) sound
+// when the signal pin is pulled LOW, because a PNP conducts on a low base --
+// so idle has to be HIGH. This matters more than it sounds: the ESP8266 core's
+// noTone() finishes with digitalWrite(pin, 0), which on such a module leaves
+// the buzzer howling after every chirp, so the idle level is restored by hand.
+// Set to 0 for a bare 2-pin piezo or an NPN-driven module (idle LOW).
+#define BUZZER_ACTIVE_LOW  1
+
+// Only sound off for rotorcraft closer than this. The radar ring is 30 km, so
+// something well inside that is the interesting case.
+#define BUZZER_RANGE_KM  15.0
+
+// Radar-sweep blip: chirp as the sweep passes over a rotorcraft, but only
+// while the RADAR screen is actually showing. That works out to ~3 chirps per
+// screen cycle rather than a continuous sonar, which is what makes it
+// tolerable. Set to 0 to keep only the acquisition/loiter alerts.
+#define BUZZER_SWEEP_BLIP  1
+
+// Quiet hours (local time, 24 h). A helicopter at 3 am should not wake you.
+// Set both to the same value to disable. Wraps midnight, so 22 -> 5 works.
+#define BUZZER_QUIET_START  22
+#define BUZZER_QUIET_END     5
+
 // ---- OLED wiring (I2C, 4-pin panel -- the default build) -----------------
 // NON-STANDARD PINS: D7/D5 instead of the ESP8266 defaults D2/D1, because the
 // 7-pin SPI panel this project started with already had wires on those two
