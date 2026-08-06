@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ESP8266 firmware driving a 0.96" SSD1306 OLED as a desk "radar" for ADS-B
 aircraft. It polls OpenSky for aircraft near a fixed home coordinate, picks the
 closest one, and cycles five screens. Weather, airline/route lookup and an NTP
-clock are secondary data sources. Everything is one Arduino sketch — there is no
-test suite and no host-side build.
+clock are secondary data sources. Everything is one Arduino sketch; the repo has
+no test suite and no host build (but see *Testing logic on the host* below).
 
 ## Commands
 
@@ -46,19 +46,37 @@ while time.time() < end:
 ```
 
 Expect ~200 ms of binary garbage at boot — that is the ESP8266 bootloader
-talking at 74880 baud, not a fault. A healthy boot logs `[oled]`, `[wifi]`,
-`[auth]`, `[fetch]`, `[route]`, `[wx]` lines.
+talking at 74880 baud, not a fault. A healthy boot logs `[oled]`, `[buzz]`,
+`[wifi]`, `[auth]`, `[fetch]`, `[wx]` and, when a helicopter is around,
+`[heli]` and `[route]`.
 
 The Arduino IDE also works (`firmware/plane_spotter/plane_spotter.ino`) with
 U8g2 + ArduinoJson installed by hand; PlatformIO pins those in
 `firmware/platformio.ini`.
 
+### Testing logic on the host
+
+Most of this firmware can only be exercised with hardware and live sky, but the
+pure-logic parts (loiter state machine, sweep-crossing geometry, quiet hours)
+are worth testing directly, because their failure modes need a real helicopter
+loitering for minutes to reproduce on-device.
+
+The approach that works: `awk`-extract the function bodies out of the `.ino`
+into `.inc` fragments, then `#include` them into a host `.cpp` that stubs
+`millis()`, `Serial` and the Arduino time API. That tests shipped source rather
+than a reimplementation. Watch the extraction ranges — one-liner functions like
+`deg2rad` do not end in a line-initial `}`, so a naive `/start/,/^\}/` range
+runs on and swallows the next function.
+
+These harnesses live outside the repo (no test infra here) and are rebuilt as
+needed; they are cheap to recreate and brittle against reordering.
+
 ## Architecture
 
-`firmware/plane_spotter/plane_spotter.ino` is the whole program (~1170 lines),
+`firmware/plane_spotter/plane_spotter.ino` is the whole program (~1460 lines),
 organized top-to-bottom as: display constructor → data structs → math helpers →
-network fetchers → drawing primitives → five `screenX()` functions → `render()`
-→ `setup()`/`loop()`.
+rotorcraft tracking → network fetchers → buzzer → drawing primitives → five
+`screenX()` functions → `render()` → `setup()`/`loop()`.
 
 `loop()` is a cooperative scheduler on `millis()` deltas, no RTOS or timers. It
 runs at ~30 fps (`delay(33)`) so the radar sweep animates and the clock ticks,
@@ -140,25 +158,41 @@ discriminate on track swing rather than displacement), not lowering the number.
 
 ### Buzzer
 
-A passive piezo on `PIN_BUZZER` (D6/GPIO12) chirps for rotorcraft only. Three
-distinguishable voices: a tick as the radar sweep crosses a contact, a two-tone
-on acquisition, a lower insistent triple on loiter latch. All gated on
-`BUZZER_RANGE_KM`, and suppressed during quiet hours — which fall *open*
-(audible) until NTP syncs, so a clock that never sets cannot silence it.
+A passive buzzer on `PIN_BUZZER` (D6/GPIO12) chirps for rotorcraft only. Three
+voices: a tick as the radar sweep crosses a contact, a two-tone on acquisition,
+a lower insistent triple on loiter latch. All gated on `BUZZER_RANGE_KM`, and
+suppressed during quiet hours — which fall *open* (audible) until NTP syncs, so
+a clock that never sets cannot silence it.
 
-Everything is non-blocking. `tone()` is timer-driven and returns immediately;
-multi-chirp patterns are sequenced by `buzzerService()` scheduling the next
-chirp from `loop()`. Never add `delay()` here — it would stutter the 30 fps
-sweep. A pattern in flight is not interrupted, so a sweep tick cannot stomp the
-tail of a loiter alert.
+**Polarity is the trap here.** The hardware is a 3-pin module driven by an
+S9012, which is a **PNP** transistor: it conducts on a LOW base, so the module
+sounds when the pin is pulled low and must idle **HIGH**. Two consequences that
+are easy to get backwards:
+
+- Parking the pin LOW at boot — the intuitive way to keep it quiet — makes this
+  module sound continuously instead.
+- The core's `noTone()` ends with `digitalWrite(pin, 0)`, so anything relying on
+  `tone()`'s duration argument leaves the buzzer howling after every chirp.
+
+`buzzerService()` therefore drives `tone()`/`noTone()` itself and restores
+`BUZZER_IDLE_LEVEL` by hand once a chirp ends. Do not "simplify" it back to
+`tone(pin, freq, duration)`. `BUZZER_ACTIVE_LOW` covers the other polarity (bare
+2-pin element or NPN module).
+
+Voices sit at 4000 / 3000 / 2200 Hz. These elements have no oscillator and want
+**2–5 kHz** — below ~2 kHz they go noticeably quiet, so keep new tones in band.
+
+Everything is non-blocking. Never add `delay()` here — it would stutter the
+30 fps sweep. A pattern in flight is not preempted, so a sweep tick cannot stomp
+the tail of a loiter alert.
 
 The pin choice is constrained, not arbitrary: GPIO16 (D0) is off the normal
-GPIO mux and cannot do `tone()`; GPIO0/GPIO2 must be HIGH at boot and a piezo
+GPIO mux and cannot do `tone()`; GPIO0/GPIO2 must be HIGH at boot and a buzzer
 coil dragging them down prevents booting; GPIO15 must be LOW at boot. GPIO12 is
 free in both display builds.
 
-`BUZZER_ENABLE` and `BUZZER_SWEEP_BLIP` are independent compile-time switches —
-check all four combinations build when touching this code.
+`BUZZER_ENABLE`, `BUZZER_ACTIVE_LOW` and `BUZZER_SWEEP_BLIP` are independent
+compile-time switches — check the combinations still build when touching this.
 
 ### Type icons
 
@@ -166,6 +200,16 @@ OpenSky's emitter category (state index 17, needs `extended=1`) is usually `0` i
 practice, so `effectiveCategory()` estimates the aircraft type from altitude and
 speed and marks the guess with a leading `~` (e.g. `~Small`). Real categories,
 when present, are used unmodified.
+
+## Workflow
+
+**Ask before `git commit` or `git push`.** An instruction about *where* work
+should go ("do this on a feat/ branch") is not authorization to commit it, and
+approval for one commit does not carry to the next. Creating a branch and
+building on it unprompted is fine; committing and pushing is not.
+
+Feature work goes on a `feat/…` branch, merged to `main` with `--no-ff`, and the
+branch is deleted both locally and on `fork` once merged.
 
 ## Git
 
@@ -180,3 +224,20 @@ Upstream **PR #1** (`velezf:fix/arduinojson-v7-pin`) is open and awaiting the
 owner's approval. The branch exists on `fork` only — deleting it there would
 auto-close the PR. Its content is already superseded on `main` (commit 162a116
 pins ArduinoJson ^7.0.4), so do not merge it into `main`.
+
+## Unverified on hardware
+
+Two things are written, merged and building, but have never actually run:
+
+- **Rotorcraft rendering** (cross marker, TARGET banner, doubled dwell) — the
+  loiter state machine is host-tested, but nothing has been seen on the panel,
+  because it needs a helicopter in range. Watch for `[heli] new contact` and
+  `[heli] … loitering` on serial.
+- **The buzzer, entirely** — no buzzer was wired when it was written, and the
+  board has not been flashed with it. The polarity assumption is the thing most
+  likely to be wrong: if it drones continuously from power-up, flip
+  `BUZZER_ACTIVE_LOW` to 0 and reflash. Boot logs
+  `[buzz] enabled on GPIO12 (active-low), …`.
+
+The flashed firmware on the board is therefore *older* than `main` — it predates
+the buzzer commits.
