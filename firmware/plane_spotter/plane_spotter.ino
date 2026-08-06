@@ -255,6 +255,8 @@ bool trackRotorcraft(const char* icao, double lat, double lon) {
       Serial.printf("[heli] %s loitering: %lu min within %.1f km\n",
                     icao, (unsigned long)((now - helis[i].sinceMs) / 60000UL),
                     (double)LOITER_RADIUS_KM);
+      if (haversineKm(HOME_LAT, HOME_LON, lat, lon) <= BUZZER_RANGE_KM)
+        buzzerLoiter();
     }
     return helis[i].loitering;
   }
@@ -278,6 +280,8 @@ bool trackRotorcraft(const char* icao, double lat, double lon) {
   helis[slot].lastSeenMs = now;
   helis[slot].loitering  = false;
   Serial.printf("[heli] new contact %s\n", icao);
+  if (haversineKm(HOME_LAT, HOME_LON, lat, lon) <= BUZZER_RANGE_KM)
+    buzzerAcquire();
   return false;
 }
 
@@ -748,6 +752,85 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
 }
 
 // Forward great-circle position: move (lat,lon) by distM metres along trackDeg.
+// ---------------------------------------------------------------------------
+// Piezo buzzer (rotorcraft alerts)
+//
+// Everything here is non-blocking: the render loop runs at ~30 fps and any
+// delay() would visibly stutter the radar sweep. tone() on the ESP8266 is
+// timer-driven and returns immediately, so a multi-chirp pattern is sequenced
+// by scheduling the next chirp rather than sleeping between them.
+// ---------------------------------------------------------------------------
+#if BUZZER_ENABLE
+
+static uint8_t  chirpsLeft  = 0;
+static uint16_t chirpFreq   = 0;
+static uint16_t chirpOnMs   = 0;
+static uint16_t chirpGapMs  = 0;
+static uint32_t chirpNextMs = 0;
+
+// Suppress alerts overnight. Falls open (audible) until NTP has synced, so a
+// clock that never sets cannot silence the buzzer forever.
+bool buzzerQuietNow() {
+  if (BUZZER_QUIET_START == BUZZER_QUIET_END) return false;   // disabled
+  if (!timeReady()) return false;
+  time_t     t  = time(nullptr);
+  struct tm* lt = localtime(&t);
+  int h = lt->tm_hour;
+  if (BUZZER_QUIET_START < BUZZER_QUIET_END)
+    return h >= BUZZER_QUIET_START && h < BUZZER_QUIET_END;
+  return h >= BUZZER_QUIET_START || h < BUZZER_QUIET_END;     // wraps midnight
+}
+
+// Queue a pattern. A pattern already in flight wins, so a sweep blip cannot
+// stomp on the tail of a loiter alert.
+void buzzerChirp(uint8_t count, uint16_t freq, uint16_t onMs, uint16_t gapMs) {
+  if (chirpsLeft > 0) return;
+  if (buzzerQuietNow()) return;
+  chirpsLeft  = count;
+  chirpFreq   = freq;
+  chirpOnMs   = onMs;
+  chirpGapMs  = gapMs;
+  chirpNextMs = millis();
+}
+
+// Emit the next chirp in the pattern when it comes due. Called every loop().
+void buzzerService() {
+  if (chirpsLeft == 0) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - chirpNextMs) < 0) return;
+  tone(PIN_BUZZER, chirpFreq, chirpOnMs);
+  chirpsLeft--;
+  chirpNextMs = now + chirpOnMs + chirpGapMs;
+}
+
+// The three voices, deliberately distinguishable without looking at the screen.
+void buzzerSweepBlip()  { buzzerChirp(1, 2600,  25,   0); }  // tick
+void buzzerAcquire()    { buzzerChirp(2, 2200,  60,  70); }  // two-tone
+void buzzerLoiter()     { buzzerChirp(3, 1500, 120, 100); }  // lower, insistent
+
+#else
+inline bool buzzerQuietNow() { return true; }
+inline void buzzerChirp(uint8_t, uint16_t, uint16_t, uint16_t) {}
+inline void buzzerService()  {}
+inline void buzzerSweepBlip(){}
+inline void buzzerAcquire()  {}
+inline void buzzerLoiter()   {}
+#endif
+
+// Sweep angle on the previous radar frame, so the sweep-crossing blip can tell
+// which bearings the beam passed over since last time.
+float prevSweepDeg = 0.0f;
+
+// True if the sweep crossed `target` between the previous frame and this one.
+// The 30 deg ceiling rejects the large jump seen on the first frame after the
+// radar screen comes back around, which would otherwise fire a stray blip.
+bool sweptPast(float prev, float cur, float target) {
+  float travelled = fmodf(cur - prev + 360.0f, 360.0f);
+  if (travelled <= 0.0f || travelled > 30.0f) return false;
+  float offset = fmodf(target - prev + 360.0f, 360.0f);
+  return offset <= travelled;
+}
+
 void projectLatLon(double lat, double lon, float trackDeg, double distM,
                    double& outLat, double& outLon) {
   double dr = distM / 6371000.0;
@@ -1095,12 +1178,21 @@ void screenRadar() {
       u8g2.drawHLine(bx - 2, by, 5);
       u8g2.drawVLine(bx, by - 2, 5);
       if (blips[i].loiter && ((millis() / 400) & 1)) u8g2.drawCircle(bx, by, 4);
+#if BUZZER_ENABLE && BUZZER_SWEEP_BLIP
+      // Chirp as the beam crosses it -- the classic radar tick, but only for
+      // rotorcraft, only inside BUZZER_RANGE_KM, and only while this screen is
+      // up, which keeps it to a few ticks per screen cycle instead of a sonar.
+      if (dist <= BUZZER_RANGE_KM && sweptPast(prevSweepDeg, sweepDeg, (float)brg))
+        buzzerSweepBlip();
+#endif
     } else {
       float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
       if (behind < 50) u8g2.drawDisc(bx, by, 1);   // freshly swept
       else             u8g2.drawPixel(bx, by);     // fading
     }
   }
+
+  prevSweepDeg = sweepDeg;
 
   // highlight the closest live contact
   if (nearIdx >= 0) {
@@ -1280,6 +1372,16 @@ void setup() {
   }
 #endif
 
+#if BUZZER_ENABLE
+  // Drive the pin low before anything else so a floating input cannot leave the
+  // piezo squealing between boot and the first tone().
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  Serial.printf("[buzz] enabled on GPIO%d, range %.0f km, quiet %02d:00-%02d:00\n",
+                PIN_BUZZER, (double)BUZZER_RANGE_KM,
+                BUZZER_QUIET_START, BUZZER_QUIET_END);
+#endif
+
   u8g2.begin();
   u8g2.setContrast(180);
 
@@ -1330,5 +1432,6 @@ void loop() {
   }
 
   render();
+  buzzerService();   // non-blocking: emits any queued chirp that is now due
   delay(33);   // ~30 fps: smooth radar sweep + fast-ticking clock
 }
