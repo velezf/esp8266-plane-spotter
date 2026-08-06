@@ -73,8 +73,12 @@
 #define HELI_EXPIRE_MS    300000   // 5 min
 
 // ---- Piezo buzzer (rotorcraft alerts) ------------------------------------
-// Passive piezo: one leg to PIN_BUZZER, the other to GND. A ~100 ohm series
-// resistor is cheap insurance -- ESP8266 pins are only good for ~12 mA.
+// Passive buzzer -- it has no oscillator of its own, so the firmware drives it
+// with tone(). 3-pin module: VCC->3V3, GND->GND, S/IO->PIN_BUZZER. Bare 2-pin
+// element: one leg to PIN_BUZZER, the other to GND, and set BUZZER_ACTIVE_LOW
+// to 0. For a bare element a ~100 ohm series resistor is cheap insurance --
+// ESP8266 pins are only good for ~12 mA; transistor modules drive their own
+// current from VCC and do not need it.
 //
 // D6/GPIO12 is the right pin here and the alternatives mostly are not:
 // GPIO16 (D0) is not on the normal GPIO mux and cannot do tone(); GPIO0 (D3)
@@ -85,6 +89,14 @@
 
 // Master switch. 0 compiles the buzzer out entirely.
 #define BUZZER_ENABLE  1
+
+// Drive polarity. 3-pin modules built around an S9012 (a PNP transistor) sound
+// when the signal pin is pulled LOW, because a PNP conducts on a low base --
+// so idle has to be HIGH. This matters more than it sounds: the ESP8266 core's
+// noTone() finishes with digitalWrite(pin, 0), which on such a module leaves
+// the buzzer howling after every chirp, so the idle level is restored by hand.
+// Set to 0 for a bare 2-pin piezo or an NPN-driven module (idle LOW).
+#define BUZZER_ACTIVE_LOW  1
 
 // Only sound off for rotorcraft closer than this. The radar ring is 30 km, so
 // something well inside that is the interesting case.

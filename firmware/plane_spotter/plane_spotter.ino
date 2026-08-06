@@ -762,7 +762,11 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
 // ---------------------------------------------------------------------------
 #if BUZZER_ENABLE
 
+// Level that leaves the buzzer silent. See BUZZER_ACTIVE_LOW in config.h.
+#define BUZZER_IDLE_LEVEL (BUZZER_ACTIVE_LOW ? HIGH : LOW)
+
 static uint8_t  chirpsLeft  = 0;
+static bool     chirpOn     = false;   // a chirp is currently sounding
 static uint16_t chirpFreq   = 0;
 static uint16_t chirpOnMs   = 0;
 static uint16_t chirpGapMs  = 0;
@@ -784,7 +788,7 @@ bool buzzerQuietNow() {
 // Queue a pattern. A pattern already in flight wins, so a sweep blip cannot
 // stomp on the tail of a loiter alert.
 void buzzerChirp(uint8_t count, uint16_t freq, uint16_t onMs, uint16_t gapMs) {
-  if (chirpsLeft > 0) return;
+  if (chirpsLeft > 0 || chirpOn) return;
   if (buzzerQuietNow()) return;
   chirpsLeft  = count;
   chirpFreq   = freq;
@@ -793,20 +797,36 @@ void buzzerChirp(uint8_t count, uint16_t freq, uint16_t onMs, uint16_t gapMs) {
   chirpNextMs = millis();
 }
 
-// Emit the next chirp in the pattern when it comes due. Called every loop().
+// Advance the chirp pattern. Called every loop().
+//
+// This drives tone()/noTone() itself rather than using tone()'s duration
+// argument, because the core's noTone() ends with digitalWrite(pin, 0) and an
+// active-low module reads that as "sound forever". Stopping by hand is the
+// only way to put the pin back to its true idle level afterwards.
 void buzzerService() {
-  if (chirpsLeft == 0) return;
+  if (chirpsLeft == 0 && !chirpOn) return;
   uint32_t now = millis();
   if ((int32_t)(now - chirpNextMs) < 0) return;
-  tone(PIN_BUZZER, chirpFreq, chirpOnMs);
-  chirpsLeft--;
-  chirpNextMs = now + chirpOnMs + chirpGapMs;
+
+  if (chirpOn) {
+    noTone(PIN_BUZZER);
+    digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+    chirpOn     = false;
+    chirpNextMs = now + chirpGapMs;
+  } else {
+    tone(PIN_BUZZER, chirpFreq);
+    chirpOn     = true;
+    chirpsLeft--;
+    chirpNextMs = now + chirpOnMs;
+  }
 }
 
 // The three voices, deliberately distinguishable without looking at the screen.
-void buzzerSweepBlip()  { buzzerChirp(1, 2600,  25,   0); }  // tick
-void buzzerAcquire()    { buzzerChirp(2, 2200,  60,  70); }  // two-tone
-void buzzerLoiter()     { buzzerChirp(3, 1500, 120, 100); }  // lower, insistent
+// All sit inside the 2-5 kHz band where these piezo elements are loudest;
+// below ~2 kHz they go noticeably quiet.
+void buzzerSweepBlip()  { buzzerChirp(1, 4000,  25,  40); }  // crisp tick
+void buzzerAcquire()    { buzzerChirp(2, 3000,  60,  70); }  // two-tone
+void buzzerLoiter()     { buzzerChirp(3, 2200, 120, 100); }  // lowest, insistent
 
 #else
 inline bool buzzerQuietNow() { return true; }
@@ -1373,12 +1393,14 @@ void setup() {
 #endif
 
 #if BUZZER_ENABLE
-  // Drive the pin low before anything else so a floating input cannot leave the
-  // piezo squealing between boot and the first tone().
+  // Park the pin at its idle level before anything else, so the buzzer is not
+  // sounding between boot and the first chirp. Which level that is depends on
+  // the module: an active-low (PNP) one idles HIGH.
   pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
-  Serial.printf("[buzz] enabled on GPIO%d, range %.0f km, quiet %02d:00-%02d:00\n",
-                PIN_BUZZER, (double)BUZZER_RANGE_KM,
+  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+  Serial.printf("[buzz] enabled on GPIO%d (%s), range %.0f km, quiet %02d:00-%02d:00\n",
+                PIN_BUZZER, BUZZER_ACTIVE_LOW ? "active-low" : "active-high",
+                (double)BUZZER_RANGE_KM,
                 BUZZER_QUIET_START, BUZZER_QUIET_END);
 #endif
 
