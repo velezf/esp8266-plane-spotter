@@ -54,12 +54,45 @@ see the rate-limit note below).
 | Part | Notes |
 |------|-------|
 | ESP8266 board | NodeMCU v2/v3, Wemos D1 mini, or similar |
-| 0.96" OLED, **SSD1306**, **4-wire SPI** | 7-pin module: `GND VCC SCK SDA RES DC CS` |
+| 0.96" OLED, **SSD1306**, **I²C** | 4-pin module: `GND VCC SCL SDA` |
 
 ### Wiring
 
-Hardware SPI is used, so `SCK` and `SDA` are fixed; the other three pins are
-configurable in `config.h`.
+Four wires. Note the **non-standard I²C pins**: this build uses D7/D5 rather
+than the ESP8266 defaults D2/D1, because those are the pads the original 7-pin
+SPI panel already used. On the ESP8266 the `Wire` library is a bit-banged
+software I²C master, so any GPIO pair works as long as the pins are passed to
+`Wire.begin()` — which the sketch does. Pins live in `config.h`.
+
+| OLED pin | ESP8266 (NodeMCU label / GPIO) | Role |
+|----------|-------------------------------|------|
+| GND | GND | Ground |
+| VCC | 3V3 | Power |
+| SCL | **D5 / GPIO14** | I²C clock |
+| SDA | **D7 / GPIO13** | I²C data |
+
+```
+        ESP8266 (NodeMCU)                OLED SSD1306 I²C
+      ┌───────────────────┐            ┌──────────────────┐
+      │ 3V3 ──────────────┼────────────┤ VCC              │
+      │ GND ──────────────┼────────────┤ GND              │
+      │ D5/GPIO14 ────────┼────────────┤ SCL              │
+      │ D7/GPIO13 ────────┼────────────┤ SDA              │
+      └───────────────────┘            └──────────────────┘
+```
+
+> These pins avoid the ESP8266 boot-strapping pins (GPIO0/2/15), so the board
+> flashes and boots reliably. The panel has no reset line, so U8g2 is given
+> `U8X8_PIN_NONE` (the equivalent of `-1` in Adafruit_SSD1306).
+
+> Pin order varies between panels (`GND VCC SCL SDA` vs `VCC GND SCL SDA`) — match
+> the silkscreen labels, not the position. `setup()` probes both `0x3C` and `0x3D`
+> and uses whichever answers, so either module variant works unmodified.
+
+#### Using the 7-pin SPI panel instead
+
+Set `#define DISPLAY_I2C 1` to `0` in `plane_spotter.ino` and reflash. Hardware
+SPI fixes `SCK`/`SDA`; the other three pins are configurable in `config.h`.
 
 | OLED pin | ESP8266 (NodeMCU label / GPIO) | Role |
 |----------|-------------------------------|------|
@@ -70,37 +103,6 @@ configurable in `config.h`.
 | RES | D0 / GPIO16 | Reset |
 | DC  | D2 / GPIO4  | Data/Command |
 | CS  | D1 / GPIO5  | Chip select |
-
-> The default pins avoid the ESP8266 boot-strapping pins (GPIO0/2/15), so the
-> board flashes and boots reliably.
-
-#### Using an I²C panel instead
-
-If you only have (or prefer) a **4-pin I²C** SSD1306, flip `#define DISPLAY_I2C 0`
-to `1` in `plane_spotter.ino` and reflash. It's the only code change — the sketch
-switches to hardware I²C on the ESP8266 default `Wire` pins, and `RES/DC/CS` are
-unused. Only four wires:
-
-| OLED pin | ESP8266 (NodeMCU label / GPIO) | Role |
-|----------|-------------------------------|------|
-| GND | GND | Ground |
-| VCC | 3V3 | Power |
-| SCL | **D1 / GPIO5** | I²C clock |
-| SDA | **D2 / GPIO4** | I²C data |
-
-```
-        ESP8266 (NodeMCU)                OLED SSD1306 I²C
-      ┌───────────────────┐            ┌──────────────────┐
-      │ 3V3 ──────────────┼────────────┤ VCC              │
-      │ GND ──────────────┼────────────┤ GND              │
-      │ D1/GPIO5 ─────────┼────────────┤ SCL              │
-      │ D2/GPIO4 ─────────┼────────────┤ SDA              │
-      └───────────────────┘            └──────────────────┘
-```
-
-> Pin order varies between panels (`GND VCC SCL SDA` vs `VCC GND SCL SDA`) — match
-> the silkscreen labels, not the position. If the screen stays blank, add
-> `u8g2.setI2CAddress(0x78)` in `setup()` for the alternate address.
 
 ### 3D-printed case
 

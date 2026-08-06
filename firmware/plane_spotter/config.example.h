@@ -46,7 +46,19 @@
 #define OPENSKY_CLIENT_ID      ""
 #define OPENSKY_CLIENT_SECRET  ""
 
-// ---- OLED wiring (hardware SPI) ------------------------------------------
+// ---- OLED wiring (I2C, 4-pin panel -- the default build) -----------------
+// NON-STANDARD PINS: D7/D5 instead of the ESP8266 defaults D2/D1, because the
+// 7-pin SPI panel this project started with already had wires on those two
+// pads. Software I2C on the ESP8266 does not care which GPIOs are used.
+#define PIN_OLED_SDA  13   // D7
+#define PIN_OLED_SCL  14   // D5
+
+// 7-bit address. Most 0.96" SSD1306 modules are 0x3C, a few are 0x3D; setup()
+// probes for both, so this is only the preferred one to try first.
+#define OLED_I2C_ADDR      0x3C
+#define OLED_I2C_ADDR_ALT  0x3D
+
+// ---- OLED wiring (hardware SPI, only used when DISPLAY_I2C is 0) ---------
 // SCK -> GPIO14 (D5) and SDA/MOSI -> GPIO13 (D7) are fixed by HW SPI.
 // These three are configurable:
 #define PIN_OLED_RST  16   // D0

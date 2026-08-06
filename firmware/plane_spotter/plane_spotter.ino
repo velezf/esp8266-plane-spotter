@@ -2,22 +2,21 @@
  * ESP8266 Plane Spotter
  * --------------------------------------------------------------------------
  * Shows the aircraft currently flying closest to your home on a 0.96" SSD1306
- * SPI OLED, plus a bunch of nerdy statistics. Live ADS-B data is pulled from
+ * I2C OLED, plus a bunch of nerdy statistics. Live ADS-B data is pulled from
  * the free OpenSky Network REST API.
  *
  * Board   : any ESP8266 (NodeMCU v2/v3, Wemos D1 mini, ...)
- * Display : 0.96" OLED 4-wire SPI, SSD1306 128x64 (7 pins:
- *           GND, VCC, SCK, SDA, RES, DC, CS)
+ * Display : 0.96" OLED I2C, SSD1306 128x64 (4 pins: GND, VCC, SCL, SDA)
  *
  * Wiring (default, see README for the full table):
  *   OLED      ESP8266 (NodeMCU label / GPIO)
  *   GND  -->  GND
  *   VCC  -->  3V3
- *   SCK  -->  D5  / GPIO14   (HW SPI SCLK, fixed)
- *   SDA  -->  D7  / GPIO13   (HW SPI MOSI, fixed)
- *   RES  -->  D0  / GPIO16
- *   DC   -->  D2  / GPIO4
- *   CS   -->  D1  / GPIO5
+ *   SCL  -->  D5  / GPIO14   (NON-STANDARD I2C clock, see note below)
+ *   SDA  -->  D7  / GPIO13   (NON-STANDARD I2C data,  see note below)
+ *
+ * The 7-pin SPI panel this project originally used is still supported: set
+ * DISPLAY_I2C to 0 below and wire SCK=D5, SDA=D7, RES=D0, DC=D2, CS=D1.
  *
  * Libraries (install from the Arduino Library Manager):
  *   - U8g2        by olikraus
@@ -31,6 +30,7 @@
 #include <ESP8266HTTPClient.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
+#include <Wire.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -39,26 +39,40 @@
 
 // ---------------------------------------------------------------------------
 // Display: SSD1306 128x64. Two builds selectable with DISPLAY_I2C:
-//   0 = 4-wire hardware SPI (default, 7-pin panel). HW SPI uses the fixed
-//       ESP8266 pins SCLK=GPIO14 (D5) and MOSI=GPIO13 (D7); only CS / DC /
-//       RESET are configurable here.
-//   1 = hardware I2C (fallback for a 4-pin panel). Uses the ESP8266 default
-//       Wire pins SDA=GPIO4 (D2) and SCL=GPIO5 (D1); wire VCC/GND as usual and
-//       leave RES/DC/CS unconnected. If the screen stays blank, the other
-//       common I2C address is 0x78 -> add u8g2.setI2CAddress(0x78) in setup().
-// Everything below the constructor is bus-agnostic U8g2 API, so only this line
-// changes between the two builds.
+//   1 = I2C, 4-pin panel (default). GND / VCC / SCL / SDA only.
+//   0 = 4-wire hardware SPI, 7-pin panel (the original build).
+// Everything below the constructor is bus-agnostic U8g2 API, so only the
+// constructor changes between the two builds.
+//
+// NON-STANDARD I2C PINS: this board is wired SDA=GPIO13 (D7) and SCL=GPIO14
+// (D5), NOT the ESP8266 defaults SDA=GPIO4 (D2) / SCL=GPIO5 (D1). Those are
+// the two pins the 7-pin SPI panel already used (HW SPI MOSI/SCLK), so the
+// existing solder joints were reused as-is. This is fine on the ESP8266: the
+// Arduino Wire library here is a bit-banged software I2C master, so any pair
+// of GPIOs works as long as the pins are passed explicitly to Wire.begin() --
+// which the U8g2 HW_I2C backend does for us when the constructor is given a
+// clock/data pair (see U8x8lib.cpp, U8X8_MSG_BYTE_INIT).
+//
+// The panel has no reset line, so reset is U8X8_PIN_NONE (the U8g2 equivalent
+// of passing -1 for the reset pin to Adafruit_SSD1306).
+//
+// Address: most 0.96" modules are 0x3C, some are 0x3D. setup() probes both and
+// picks whichever ACKs, so either module works without a recompile. Note U8g2
+// takes the *8-bit* address, i.e. 0x3C -> 0x78 and 0x3D -> 0x7A.
 // ---------------------------------------------------------------------------
-#define DISPLAY_I2C 0   // flip to 1 and reflash if you swap in an I2C panel
-
-#define OLED_CS   PIN_OLED_CS
-#define OLED_DC   PIN_OLED_DC
-#define OLED_RST  PIN_OLED_RST
+#define DISPLAY_I2C 1   // flip to 0 and reflash if you swap back to an SPI panel
 
 #if DISPLAY_I2C
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/ U8X8_PIN_NONE);
+// Constructor args: (rotation, reset, clock/SCL, data/SDA).
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0,
+                                         /*reset=*/ U8X8_PIN_NONE,
+                                         /*clock=*/ PIN_OLED_SCL,
+                                         /*data=*/  PIN_OLED_SDA);
 #else
-U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0, OLED_CS, OLED_DC, OLED_RST);
+U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
+                                            PIN_OLED_CS,
+                                            PIN_OLED_DC,
+                                            PIN_OLED_RST);
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1083,8 +1097,37 @@ void render() {
 // ---------------------------------------------------------------------------
 // Arduino entry points
 // ---------------------------------------------------------------------------
+#if DISPLAY_I2C
+// Probe the bus for the panel and point U8g2 at whichever address answers.
+// Returns the 7-bit address found, or 0 if nothing ACKed.
+static uint8_t detectOledAddress() {
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  const uint8_t candidates[2] = { OLED_I2C_ADDR, OLED_I2C_ADDR_ALT };
+  for (uint8_t i = 0; i < 2; i++) {
+    Wire.beginTransmission(candidates[i]);
+    if (Wire.endTransmission() == 0) return candidates[i];
+  }
+  return 0;
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
+  Serial.println();
+
+#if DISPLAY_I2C
+  uint8_t addr = detectOledAddress();
+  if (addr) {
+    Serial.printf("[oled] SSD1306 found at 0x%02X on SDA=GPIO%d SCL=GPIO%d\n",
+                  addr, PIN_OLED_SDA, PIN_OLED_SCL);
+    u8g2.setI2CAddress(addr << 1);   // U8g2 wants the 8-bit form
+  } else {
+    Serial.printf("[oled] no I2C device on SDA=GPIO%d SCL=GPIO%d - check "
+                  "wiring/power; trying 0x%02X anyway\n",
+                  PIN_OLED_SDA, PIN_OLED_SCL, OLED_I2C_ADDR);
+  }
+#endif
+
   u8g2.begin();
   u8g2.setContrast(180);
 
