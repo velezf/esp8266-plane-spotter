@@ -46,6 +46,32 @@
 #define OPENSKY_CLIENT_ID      ""
 #define OPENSKY_CLIENT_SECRET  ""
 
+// ---- Rotorcraft loiter detection -----------------------------------------
+// A helicopter that stays within LOITER_RADIUS_KM of where it was first seen
+// for LOITER_MIN_MS is "loitering" (orbiting traffic/news/survey birds), as
+// opposed to one transiting through. Drift outside the radius re-anchors it.
+// Raise the radius if wide orbits keep resetting; lower it to only catch tight
+// holds. HELI_EXPIRE_MS is how long a helicopter is remembered after it drops
+// off ADS-B -- kept generously longer than LOITER_MIN_MS so a brief ADS-B
+// coverage gap does not reset an orbit that is already accumulating.
+//
+// Detection is sampled at the poll rate, so LOITER_MIN_MS is really "this many
+// UPDATE_INTERVAL_MS samples in a row". Two samples is the practical floor:
+// one sample decides off a single displacement, and a helicopter cruising
+// ~200 km/h only just clears the 3 km radius in 60 s, so a slower transit
+// would false-positive. It matters more than it looks, because categoryFrom()
+// *guesses* rotorcraft for anything under 120 km/h when OpenSky omits the
+// category -- those are slow by definition and would latch instantly at one
+// sample. By two samples even a 120 km/h target is 4 km out and re-anchors.
+//
+// To detect faster you have to change the input, not this number: either poll
+// harder (UPDATE_INTERVAL_MS, costs OpenSky quota) or discriminate on track
+// swing rather than displacement, since an orbiting aircraft sweeps heading
+// through 360 deg while a transit holds it steady.
+#define LOITER_RADIUS_KM  3.0
+#define LOITER_MIN_MS     120000   // 2 min (= 2 polls at the default 60 s)
+#define HELI_EXPIRE_MS    300000   // 5 min
+
 // ---- OLED wiring (I2C, 4-pin panel -- the default build) -----------------
 // NON-STANDARD PINS: D7/D5 instead of the ESP8266 defaults D2/D1, because the
 // 7-pin SPI panel this project started with already had wires on those two

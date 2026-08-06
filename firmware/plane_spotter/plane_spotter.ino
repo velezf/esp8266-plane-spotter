@@ -98,12 +98,38 @@ struct Aircraft {
 Aircraft nearest;
 
 // Per-aircraft state for the radar, including enough to dead-reckon (estimate)
-// the position between data refreshes so the blips creep in real time.
-struct Blip { double lat; double lon; float track; float speedMs; };
+// the position between data refreshes so the blips creep in real time. `cat`
+// and `loiter` are resolved at fetch time so the radar can mark rotorcraft
+// without re-deriving the type 30x a second.
+struct Blip {
+  double  lat;
+  double  lon;
+  float   track;
+  float   speedMs;
+  uint8_t cat;      // effective emitter category (8 = rotorcraft)
+  bool    loiter;   // rotorcraft that has held station (see HeliTrack)
+};
 const uint8_t MAX_BLIPS = 20;
 Blip     blips[MAX_BLIPS];
 uint8_t  blipCount  = 0;
 uint32_t lastDataMs = 0;   // millis() of the last successful aircraft fetch
+
+// Rotorcraft get special treatment, which means they need an identity that
+// survives across fetches -- blips[] is rebuilt from scratch every poll, so it
+// cannot answer "has this one been sitting there?". This table is keyed by
+// icao24 and holds an anchor position per helicopter: stay within
+// LOITER_RADIUS_KM of the anchor for LOITER_MIN_MS and it is loitering; wander
+// outside and the anchor resets, because that is transit, not orbit.
+struct HeliTrack {
+  char     icao24[7];      // 6 hex chars + NUL
+  double   refLat, refLon; // anchor position
+  uint32_t sinceMs;        // when this anchor was set
+  uint32_t lastSeenMs;
+  bool     loitering;
+};
+const uint8_t MAX_HELI = 4;
+HeliTrack helis[MAX_HELI];
+uint8_t   heliCount = 0;
 
 // OpenSky OAuth2 bearer token (when client credentials are configured).
 String   accessToken;
@@ -191,6 +217,93 @@ const char* compass(double bearing) {
 // ---------------------------------------------------------------------------
 // WiFi
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Aircraft type + rotorcraft tracking
+// ---------------------------------------------------------------------------
+
+// OpenSky usually leaves the emitter category at 0 (unknown), so fall back to a
+// rough guess from altitude + ground speed. Real category data always wins.
+// Estimated types are flagged with '~' on screen.
+int categoryFrom(int cat, bool onGround, float velocityMs, float altitudeM) {
+  if (cat > 0)  return cat;                   // real data
+  if (onGround) return 0;
+  float kmh = velocityMs * 3.6f;
+  if (kmh < 120 && altitudeM < 2200) return 8;  // slow & low -> guess helicopter
+  if (kmh < 300 && altitudeM < 5000) return 3;  // medium      -> guess small plane
+  return 4;                                     // fast / high -> airliner
+}
+
+bool isRotor(int cat) { return cat == 8; }
+
+// Fold one rotorcraft sighting into the tracking table. Returns true if this
+// airframe currently counts as loitering. Called once per rotorcraft per fetch.
+bool trackRotorcraft(const char* icao, double lat, double lon) {
+  uint32_t now = millis();
+  if (icao == nullptr || icao[0] == '\0') return false;
+
+  for (uint8_t i = 0; i < heliCount; i++) {
+    if (strcmp(helis[i].icao24, icao) != 0) continue;
+    helis[i].lastSeenMs = now;
+    if (haversineKm(helis[i].refLat, helis[i].refLon, lat, lon) > LOITER_RADIUS_KM) {
+      helis[i].refLat    = lat;    // moved on: re-anchor, it is transiting
+      helis[i].refLon    = lon;
+      helis[i].sinceMs   = now;
+      helis[i].loitering = false;
+    } else if (!helis[i].loitering &&
+               (uint32_t)(now - helis[i].sinceMs) >= LOITER_MIN_MS) {
+      helis[i].loitering = true;
+      Serial.printf("[heli] %s loitering: %lu min within %.1f km\n",
+                    icao, (unsigned long)((now - helis[i].sinceMs) / 60000UL),
+                    (double)LOITER_RADIUS_KM);
+    }
+    return helis[i].loitering;
+  }
+
+  // New airframe. If the table is full, evict the stalest entry -- a helicopter
+  // we have not seen in a while is less interesting than one on screen now.
+  uint8_t slot;
+  if (heliCount < MAX_HELI) {
+    slot = heliCount++;
+  } else {
+    slot = 0;
+    for (uint8_t i = 1; i < heliCount; i++)
+      if ((uint32_t)(now - helis[i].lastSeenMs) >
+          (uint32_t)(now - helis[slot].lastSeenMs)) slot = i;
+  }
+  strncpy(helis[slot].icao24, icao, sizeof(helis[slot].icao24) - 1);
+  helis[slot].icao24[sizeof(helis[slot].icao24) - 1] = '\0';
+  helis[slot].refLat     = lat;
+  helis[slot].refLon     = lon;
+  helis[slot].sinceMs    = now;
+  helis[slot].lastSeenMs = now;
+  helis[slot].loitering  = false;
+  Serial.printf("[heli] new contact %s\n", icao);
+  return false;
+}
+
+// Drop helicopters we have not heard from in a while, so a departed aircraft
+// does not keep its slot (or come back still flagged as loitering).
+void expireRotorcraft() {
+  uint32_t now = millis();
+  uint8_t  w   = 0;
+  for (uint8_t i = 0; i < heliCount; i++) {
+    if ((uint32_t)(now - helis[i].lastSeenMs) < HELI_EXPIRE_MS) {
+      if (w != i) helis[w] = helis[i];
+      w++;
+    } else {
+      Serial.printf("[heli] %s lost\n", helis[i].icao24);
+    }
+  }
+  heliCount = w;
+}
+
+bool isLoitering(const char* icao) {
+  if (icao == nullptr || icao[0] == '\0') return false;
+  for (uint8_t i = 0; i < heliCount; i++)
+    if (strcmp(helis[i].icao24, icao) == 0) return helis[i].loitering;
+  return false;
+}
+
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -349,7 +462,8 @@ bool fetchAircraft() {
   Aircraft best;
   best.valid      = false;
   best.distanceKm = 1e9;
-  uint16_t count  = 0;
+  uint16_t count     = 0;
+  uint8_t  rotorSeen = 0;
   blipCount = 0;
 
   for (JsonArray s : states) {
@@ -360,11 +474,26 @@ bool fetchAircraft() {
     double brg = bearingDeg(HOME_LAT, HOME_LON, lat, lon);
     count++;
 
+    // Resolve the type here, while the full state vector is in hand: the radar
+    // redraws far too often to re-derive it per frame.
+    bool  onGround = s[8] | false;
+    float velMs    = s[9] | 0.0f;
+    float altM     = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
+    int   cat      = categoryFrom(s[17] | 0, onGround, velMs, altM);
+
+    bool loiter = false;
+    if (isRotor(cat)) {
+      rotorSeen++;
+      loiter = trackRotorcraft(s[0] | "", lat, lon);
+    }
+
     if (blipCount < MAX_BLIPS) {
       blips[blipCount].lat     = lat;
       blips[blipCount].lon     = lon;
       blips[blipCount].track   = s[10] | 0.0f;
-      blips[blipCount].speedMs = (s[8] | false) ? 0.0f : (s[9] | 0.0f);
+      blips[blipCount].speedMs = onGround ? 0.0f : velMs;
+      blips[blipCount].cat     = (uint8_t)cat;
+      blips[blipCount].loiter  = loiter;
       blipCount++;
     }
 
@@ -402,6 +531,8 @@ bool fetchAircraft() {
     }
   }
 
+  expireRotorcraft();
+
   stats.inView       = count;
   if (count > stats.maxInView) stats.maxInView = count;
   stats.requestsOk++;
@@ -412,8 +543,8 @@ bool fetchAircraft() {
   if (nearest.valid && nearest.distanceKm < stats.closestEver)
     stats.closestEver = nearest.distanceKm;
 
-  Serial.printf("[fetch] inView=%u blips=%u nearest=%s cat=%d dist=%.1fkm valid=%d heap=%u\n",
-                count, blipCount, nearest.valid ? nearest.callsign : "-",
+  Serial.printf("[fetch] inView=%u blips=%u rotor=%u nearest=%s cat=%d dist=%.1fkm valid=%d heap=%u\n",
+                count, blipCount, rotorSeen, nearest.valid ? nearest.callsign : "-",
                 nearest.valid ? nearest.category : -1,
                 nearest.valid ? nearest.distanceKm : 0.0, nearest.valid,
                 ESP.getFreeHeap());
@@ -791,19 +922,14 @@ void drawSignalBars(int x, int y, int rssi) {
   }
 }
 
-// OpenSky often leaves the emitter category at 0 (unknown). When that happens
-// we make a rough guess from altitude + ground speed so the icon still varies.
-// Real category data always wins. Estimated types are flagged with '~' on screen.
 int effectiveCategory(const Aircraft& a) {
-  if (a.category > 0) return a.category;     // real data
-  if (a.onGround)     return 0;
-  float kmh = a.velocityMs * 3.6f;
-  float m   = a.altitudeM;
-  if (kmh < 120 && m < 2200) return 8;       // slow & low -> guess helicopter
-  if (kmh < 300 && m < 5000) return 3;       // medium      -> guess small plane
-  return 4;                                  // fast / high -> airliner
+  return categoryFrom(a.category, a.onGround, a.velocityMs, a.altitudeM);
 }
 bool isEstimatedType(const Aircraft& a) { return a.category == 0 && !a.onGround; }
+
+// Is the current target a rotorcraft, and is it holding station?
+bool nearestIsRotor()  { return nearest.valid && isRotor(effectiveCategory(nearest)); }
+bool nearestLoitering() { return nearestIsRotor() && isLoitering(nearest.icao24); }
 
 void screenNearest() {
   drawHeader("TARGET");
@@ -851,6 +977,22 @@ void screenNearest() {
     if (fr < 0) fr = 0;
     int fh = (int)((gB - gT - 2) * fr);
     u8g2.drawBox(126, gB - 1 - fh, 1, fh);
+  }
+
+  // Rotorcraft alert, inverted so it reads as a banner rather than another
+  // data row. Sits in the bottom-left, clear of the km/h readout at x=98.
+  // A loitering one is the interesting case, so it says so and blinks.
+  if (nearestIsRotor()) {
+    bool loiter = nearestLoitering();
+    if (!loiter || ((millis() / 500) & 1)) {
+      const char* msg = loiter ? "ROTOR LOITER" : "ROTORCRAFT";
+      int w = strlen(msg) * 5 + 3;
+      u8g2.drawBox(0, 56, w, 8);
+      u8g2.setDrawColor(0);
+      u8g2.setFont(u8g2_font_5x7_tr);
+      u8g2.drawStr(2, 63, msg);
+      u8g2.setDrawColor(1);
+    }
   }
 }
 
@@ -945,9 +1087,19 @@ void screenRadar() {
     int bx = cx + (int)(sin(deg2rad(brg)) * rr);
     int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
-    float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
-    if (behind < 50) u8g2.drawDisc(bx, by, 1);   // freshly swept
-    else             u8g2.drawPixel(bx, by);     // fading
+    if (isRotor(blips[i].cat)) {
+      // A cross reads as distinct from the plain dots even at this scale, and
+      // rotorcraft deliberately skip the persistence fade -- a special contact
+      // should not thin out to one pixel between sweeps. Loitering adds a
+      // pulsing ring, which is the part that actually catches the eye.
+      u8g2.drawHLine(bx - 2, by, 5);
+      u8g2.drawVLine(bx, by - 2, 5);
+      if (blips[i].loiter && ((millis() / 400) & 1)) u8g2.drawCircle(bx, by, 4);
+    } else {
+      float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
+      if (behind < 50) u8g2.drawDisc(bx, by, 1);   // freshly swept
+      else             u8g2.drawPixel(bx, by);     // fading
+    }
   }
 
   // highlight the closest live contact
@@ -1167,7 +1319,12 @@ void loop() {
     firstWeatherDone = true;
   }
 
-  if (now - lastScreenSwap >= SCREEN_SWAP_MS[screen]) {
+  // Hold TARGET twice as long when the contact is a rotorcraft -- that is the
+  // screen carrying the alert, and it is worth actually reading.
+  uint32_t dwell = SCREEN_SWAP_MS[screen];
+  if (screen == 0 && nearestIsRotor()) dwell *= 2;
+
+  if (now - lastScreenSwap >= dwell) {
     screen = (screen + 1) % NUM_SCREENS;
     lastScreenSwap = now;
   }

@@ -118,6 +118,26 @@ The panel has no reset line, so reset is `U8X8_PIN_NONE`. `setup()` probes 0x3C
 and 0x3D and calls `setI2CAddress(addr << 1)` — **U8g2 takes the 8-bit address**,
 so 0x3C→0x78 and 0x3D→0x7A. Do not "fix" a 7-bit address into that call.
 
+### Rotorcraft
+
+Helicopters are singled out across the UI: a cross marker on the radar that
+skips the persistence fade, an inverted banner on TARGET, and double dwell on
+that screen (`loop()` computes `dwell` locally rather than reading
+`SCREEN_SWAP_MS[]` directly).
+
+Loiter detection needs identity across fetches, which `blips[]` cannot provide —
+it is rebuilt from scratch every poll. `helis[]` (`MAX_HELI` 4, keyed by icao24)
+holds an anchor position per airframe: stay within `LOITER_RADIUS_KM` for
+`LOITER_MIN_MS` and it latches as loitering; drift outside and the anchor resets,
+because that is transit rather than orbit.
+
+`LOITER_MIN_MS` is effectively a **count of polls**, not a duration — detection
+is sampled at `UPDATE_INTERVAL_MS`. Two samples is the floor. One sample decides
+off a single displacement, and `categoryFrom()` guesses rotorcraft for anything
+under 120 km/h when OpenSky omits the category, so slow traffic would latch
+immediately. Detecting faster means changing the input (poll harder, or
+discriminate on track swing rather than displacement), not lowering the number.
+
 ### Type icons
 
 OpenSky's emitter category (state index 17, needs `extended=1`) is usually `0` in
