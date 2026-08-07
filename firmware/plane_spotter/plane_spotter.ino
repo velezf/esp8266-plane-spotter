@@ -204,10 +204,24 @@ uint32_t lastPoll         = 0;
 bool     firstFetchDone   = false;
 bool     firstWeatherDone = false;
 
-const uint8_t  NUM_SCREENS    = 6;
-// Per-screen dwell time (ms), indexed by `screen`:
-//   0 TARGET  1 INTEL  2 RADAR  3 WX  4 SYSTEM  5 WEAPONS
-const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = { 12000, 12000, 12000, 7000, 7000, 12000 };
+// Page order: RADAR opens with the situational picture, then TARGET / INTEL /
+// WEAPONS are three progressively deeper views of that same nearest contact,
+// then the ambient pages. Naming them keeps the dwell table and the
+// index-sensitive logic in loop() from drifting apart on the next reorder --
+// add or move a page here and everything else follows.
+enum Screen : uint8_t {
+  SCR_RADAR, SCR_TARGET, SCR_INTEL, SCR_WEAPONS, SCR_WX, SCR_SYSTEM, NUM_SCREENS
+};
+
+// Per-screen dwell time (ms), in the same order as `enum Screen`.
+const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = {
+  12000,  // RADAR
+  12000,  // TARGET
+  12000,  // INTEL
+  12000,  // WEAPONS
+   7000,  // WX
+   7000,  // SYSTEM
+};
 
 // ---------------------------------------------------------------------------
 // Geo helpers
@@ -1745,12 +1759,12 @@ void screenWeapons() {
 void render() {
   u8g2.clearBuffer();
   switch (screen) {
-    case 0: screenNearest(); break;
-    case 1: screenDetails(); break;
-    case 2: screenRadar();   break;
-    case 3: screenWeather(); break;
-    case 4: screenSystem();  break;
-    case 5: screenWeapons(); break;
+    case SCR_RADAR:   screenRadar();   break;
+    case SCR_TARGET:  screenNearest(); break;
+    case SCR_INTEL:   screenDetails(); break;
+    case SCR_WEAPONS: screenWeapons(); break;
+    case SCR_WX:      screenWeather(); break;
+    case SCR_SYSTEM:  screenSystem();  break;
   }
   u8g2.sendBuffer();
 }
@@ -1843,7 +1857,7 @@ void loop() {
   // Hold TARGET twice as long when the contact is a rotorcraft -- that is the
   // screen carrying the alert, and it is worth actually reading.
   uint32_t dwell = SCREEN_SWAP_MS[screen];
-  if (screen == 0 && nearestIsRotor()) dwell *= 2;
+  if (screen == SCR_TARGET && nearestIsRotor()) dwell *= 2;
 
   if (now - lastScreenSwap >= dwell) {
     screen = (screen + 1) % NUM_SCREENS;

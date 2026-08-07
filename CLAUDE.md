@@ -85,6 +85,15 @@ while network fetches happen on much slower independent intervals
 rotation is driven by a per-screen dwell table, `SCREEN_SWAP_MS[]`, not a
 uniform interval.
 
+Page order is `enum Screen`: RADAR opens with the situational picture, then
+TARGET / INTEL / WEAPONS are progressively deeper views of the *same* nearest
+contact, then the ambient pages (WX, SYSTEM). Add or reorder pages by editing
+the enum and the dwell table together — `render()` and the rotorcraft
+double-dwell in `loop()` both key off the names, so nothing else needs touching.
+That indirection exists because the dwell rule was previously a bare
+`screen == 0`, which would have silently followed the index to the wrong page on
+the first reorder.
+
 The poll rate is a budget decision, not a free knob. OpenSky charges 1 credit
 per request at this bounding-box size (0.16 sq°, under the 25 sq° tier), against
 ~400/day anonymous or 4000/day with the OAuth2 client. 30 s is ~72% of the
