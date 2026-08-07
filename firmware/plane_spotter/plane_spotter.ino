@@ -97,6 +97,32 @@ struct Aircraft {
 
 Aircraft nearest;
 
+// Types for the WEAPONS SYSTEM page. Declared up here because the Arduino
+// builder emits function prototypes above the sketch body, so anything used in
+// a signature must already be a complete type by then.
+enum class AirframeClass : uint8_t { FIXED_WING, HELICOPTER, UAV, UNKNOWN };
+enum class AltitudeBand  : uint8_t { VERY_LOW, LOW_ALT, MEDIUM, MED_HIGH, HIGH_ALT, UNKNOWN };
+enum class ThreatLevel   : uint8_t { LOW_THREAT, MED_THREAT, HIGH_THREAT, UNKNOWN };
+enum class Envelope      : uint8_t { INSIDE, TOO_FAR, TOO_CLOSE, ALT_OUT, NO_DATA };
+
+// Approximate *published* reference figures. These are open-source
+// encyclopaedia-level numbers for flavour and are not authoritative: no
+// doctrinal engagement rules or no-escape-zone data are represented, because
+// none is publicly available to represent honestly.
+struct WeaponSystemRecord {
+  const char* designation;
+  const char* name;
+  const char* branch;
+  const char* role;
+  uint16_t    maxRangeKm;
+  uint16_t    minRangeKm;
+  uint16_t    ceilingKft;      // engagement ceiling, thousands of feet
+  uint16_t    missileSpeedMps;
+  uint8_t     reactionS;       // notional time from track to launch
+  uint8_t     preferredAirframe;
+};
+
+
 // Per-aircraft state for the radar, including enough to dead-reckon (estimate)
 // the position between data refreshes so the blips creep in real time. `cat`
 // and `loiter` are resolved at fetch time so the radar can mark rotorcraft
@@ -178,10 +204,10 @@ uint32_t lastPoll         = 0;
 bool     firstFetchDone   = false;
 bool     firstWeatherDone = false;
 
-const uint8_t  NUM_SCREENS    = 5;
+const uint8_t  NUM_SCREENS    = 6;
 // Per-screen dwell time (ms), indexed by `screen`:
-//   0 TARGET  1 INTEL  2 RADAR  3 WX  4 SYSTEM
-const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = { 12000, 12000, 12000, 7000, 7000 };
+//   0 TARGET  1 INTEL  2 RADAR  3 WX  4 SYSTEM  5 WEAPONS
+const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = { 12000, 12000, 12000, 7000, 7000, 12000 };
 
 // ---------------------------------------------------------------------------
 // Geo helpers
@@ -863,6 +889,293 @@ void projectLatLon(double lat, double lon, float trackDeg, double distM,
 }
 
 // ---------------------------------------------------------------------------
+// WEAPONS SYSTEM page
+//
+// A themed air-defense reference display layered over the ADS-B data already
+// being fetched. It classifies the current nearest contact, picks a matching
+// real-world US air-defense system from a small flash-resident table, and
+// shows a track-lead angle plus notional envelope figures.
+//
+// Scope, deliberately: every contact is FRIENDLY and firing authorization is
+// always denied. Nothing here is connected to anything, no real fire-control
+// or doctrinal engagement logic is implemented, and PK is a display heuristic
+// (see calcPk) rather than a lethality estimate -- there is no public data
+// from which a real one could be derived, so it is labelled NOTIONAL.
+// ---------------------------------------------------------------------------
+
+static const char WS_A_DES[] PROGMEM = "MIM-104";
+static const char WS_A_NAM[] PROGMEM = "PATRIOT";
+static const char WS_A_BRN[] PROGMEM = "US ARMY";
+static const char WS_A_ROL[] PROGMEM = "AREA DEFENSE";
+static const char WS_B_DES[] PROGMEM = "AN/TWQ-1";
+static const char WS_B_NAM[] PROGMEM = "AVENGER";
+static const char WS_B_BRN[] PROGMEM = "US ARMY";
+static const char WS_B_ROL[] PROGMEM = "SHORT RANGE";
+static const char WS_C_DES[] PROGMEM = "M-SHORAD";
+static const char WS_C_NAM[] PROGMEM = "STRYKER SHORAD";
+static const char WS_C_BRN[] PROGMEM = "US ARMY";
+static const char WS_C_ROL[] PROGMEM = "POINT DEFENSE";
+static const char WS_D_DES[] PROGMEM = "NASAMS";
+static const char WS_D_NAM[] PROGMEM = "NASAMS";
+static const char WS_D_BRN[] PROGMEM = "US / NORWAY";
+static const char WS_D_ROL[] PROGMEM = "AREA DEFENSE";
+static const char WS_E_DES[] PROGMEM = "SM-2";
+static const char WS_E_NAM[] PROGMEM = "AEGIS";
+static const char WS_E_BRN[] PROGMEM = "US NAVY";
+static const char WS_E_ROL[] PROGMEM = "FLEET DEFENSE";
+static const char WS_F_DES[] PROGMEM = "MADIS";
+static const char WS_F_NAM[] PROGMEM = "MADIS";
+static const char WS_F_BRN[] PROGMEM = "USMC EXPD";
+static const char WS_F_ROL[] PROGMEM = "POINT DEFENSE";
+
+// Index constants keep selectWeaponSystem() readable.
+enum : uint8_t { WS_PATRIOT, WS_AVENGER, WS_SHORAD, WS_NASAMS, WS_AEGIS, WS_MADIS, WS_COUNT };
+
+static const WeaponSystemRecord WEAPON_DB[WS_COUNT] PROGMEM = {
+  { WS_A_DES, WS_A_NAM, WS_A_BRN, WS_A_ROL, 160, 3, 78, 1400, 15, (uint8_t)AirframeClass::FIXED_WING },
+  { WS_B_DES, WS_B_NAM, WS_B_BRN, WS_B_ROL,   8, 1, 12,  750,  5, (uint8_t)AirframeClass::HELICOPTER },
+  { WS_C_DES, WS_C_NAM, WS_C_BRN, WS_C_ROL,   8, 1, 13,  750,  5, (uint8_t)AirframeClass::UAV },
+  { WS_D_DES, WS_D_NAM, WS_D_BRN, WS_D_ROL,  30, 2, 45, 1020, 10, (uint8_t)AirframeClass::FIXED_WING },
+  { WS_E_DES, WS_E_NAM, WS_E_BRN, WS_E_ROL, 170, 4, 79, 1200, 12, (uint8_t)AirframeClass::FIXED_WING },
+  { WS_F_DES, WS_F_NAM, WS_F_BRN, WS_F_ROL,   6, 1,  8,  750,  4, (uint8_t)AirframeClass::HELICOPTER },
+};
+
+// Pull one record out of flash into a local copy. The strings it points at stay
+// in flash, so read them with copyPgm() rather than dereferencing directly.
+void loadWeapon(uint8_t idx, WeaponSystemRecord& out) {
+  if (idx >= WS_COUNT) idx = WS_PATRIOT;
+  memcpy_P(&out, &WEAPON_DB[idx], sizeof(WeaponSystemRecord));
+}
+
+void copyPgm(char* dst, size_t n, const char* pgmStr) {
+  strncpy_P(dst, pgmStr, n - 1);
+  dst[n - 1] = '\0';
+}
+
+// Shortest signed angular difference, -180..+180.
+float normalizeSignedAngle(float degrees) {
+  while (degrees >  180.0f) degrees -= 360.0f;
+  while (degrees < -180.0f) degrees += 360.0f;
+  return degrees;
+}
+
+double calculateInitialBearingDeg(double lat1, double lon1, double lat2, double lon2) {
+  return bearingDeg(lat1, lon1, lat2, lon2);   // same great-circle formula
+}
+
+// Project a track forward along its reported ground course. Speed is metres
+// per second: OpenSky reports m/s directly, so there is no knots conversion.
+void projectTrackPosition(double lat, double lon, float trackDeg,
+                          double speedMs, uint16_t seconds,
+                          double& outLat, double& outLon) {
+  projectLatLon(lat, lon, trackDeg, speedMs * (double)seconds, outLat, outLon);
+}
+
+// SOLUTION: how far the contact's bearing *from the device* swings over the
+// look-ahead window. Positive = clockwise/right. This is a track-lead angle
+// for display, not a firing solution.
+bool calculateTrackLeadDeg(double devLat, double devLon,
+                           double acLat, double acLon,
+                           float trackDeg, double speedMs,
+                           uint16_t seconds, float& outDeg) {
+  if (!isfinite(acLat) || !isfinite(acLon))       return false;
+  if (acLat < -90.0 || acLat > 90.0)              return false;
+  if (acLon < -180.0 || acLon > 180.0)            return false;
+  if (!isfinite(speedMs) || speedMs < TRACK_MIN_SPEED_MS) return false;
+  if (!isfinite(trackDeg))                        return false;
+
+  double pLat, pLon;
+  projectTrackPosition(acLat, acLon, trackDeg, speedMs, seconds, pLat, pLon);
+  double b0 = calculateInitialBearingDeg(devLat, devLon, acLat, acLon);
+  double b1 = calculateInitialBearingDeg(devLat, devLon, pLat, pLon);
+  float  d  = normalizeSignedAngle((float)(b1 - b0));
+  if (!isfinite(d)) return false;
+  outDeg = d;
+  return true;
+}
+
+AltitudeBand classifyAltitude(float altitudeFt, bool haveAltitude) {
+  if (!haveAltitude || !isfinite(altitudeFt)) return AltitudeBand::UNKNOWN;
+  if (altitudeFt <= ALT_VLOW_MAX_FT) return AltitudeBand::VERY_LOW;
+  if (altitudeFt <= ALT_LOW_MAX_FT)  return AltitudeBand::LOW_ALT;
+  if (altitudeFt <= ALT_MED_MAX_FT)  return AltitudeBand::MEDIUM;
+  if (altitudeFt <= ALT_HIGH_MAX_FT) return AltitudeBand::MED_HIGH;
+  return AltitudeBand::HIGH_ALT;
+}
+
+// Built on the emitter category the rest of the firmware already resolves,
+// which is real ADS-B data when present and a kinematic guess otherwise.
+AirframeClass classifyAirframe(int category) {
+  switch (category) {
+    case 8:  return AirframeClass::HELICOPTER;
+    case 14: return AirframeClass::UAV;
+    case 2: case 3: case 4: case 5: case 6: case 7: case 9:
+             return AirframeClass::FIXED_WING;
+    default: return AirframeClass::UNKNOWN;
+  }
+}
+
+// "Threat" here means aspect: how directly the contact is tracking over the
+// device, tightened by range. Everything is friendly regardless -- this drives
+// nothing but the label.
+ThreatLevel classifyThreat(double bearingFromDevice, float trackDeg,
+                           double distanceKm, float altitudeFt, bool haveAlt,
+                           bool valid) {
+  if (!valid || !isfinite(trackDeg) || !isfinite(distanceKm))
+    return ThreatLevel::UNKNOWN;
+
+  // Bearing the contact would fly to pass over the device.
+  double inbound = fmod(bearingFromDevice + 180.0, 360.0);
+  float  aspect  = fabsf(normalizeSignedAngle((float)(trackDeg - inbound)));
+
+  // Slant range, not ground distance: altitude is most of how far away an
+  // aircraft actually is. Overhead at FL350 is 10.7 km, which is why a
+  // high-altitude overflight can no longer reach HIGH on ground track alone.
+  double altKm = (haveAlt && isfinite(altitudeFt)) ? altitudeFt * 0.0003048 : 0.0;
+  double slant = sqrt(distanceKm * distanceKm + altKm * altKm);
+
+  // No altitude means we cannot show it is low, so HIGH is off the table.
+  // HIGH needs low *and* close: the ceiling below is what makes it mean
+  // "near enough to read markings" rather than merely "nearly overhead".
+  if (haveAlt && altitudeFt <= THREAT_HIGH_MAX_FT &&
+      aspect < THREAT_HIGH_ASPECT_DEG && slant < THREAT_HIGH_SLANT_KM)
+    return ThreatLevel::HIGH_THREAT;
+  if (aspect < THREAT_MED_ASPECT_DEG && slant < THREAT_MED_SLANT_KM)
+    return ThreatLevel::MED_THREAT;
+  return ThreatLevel::LOW_THREAT;
+}
+
+// VERY_LOW and LOW both mean "short-range system territory" for selection.
+bool isLowBand(AltitudeBand b) {
+  return b == AltitudeBand::VERY_LOW || b == AltitudeBand::LOW_ALT;
+}
+
+uint8_t selectWeaponSystem(AirframeClass airframe, AltitudeBand band, double distanceKm) {
+#if DEFENSE_THEME == DEFENSE_THEME_NAVY
+  return WS_AEGIS;
+#elif DEFENSE_THEME == DEFENSE_THEME_MARINE
+  // MADIS is a short-range SHORAD / counter-UAS system, so it only owns the
+  // bottom of the stack: rotorcraft, UAVs, and traffic genuinely down low.
+  // Anything higher steps up the ladder rather than being claimed by it.
+  if (airframe == AirframeClass::HELICOPTER || airframe == AirframeClass::UAV ||
+      band == AltitudeBand::VERY_LOW)
+    return WS_MADIS;
+  if (band == AltitudeBand::LOW_ALT || band == AltitudeBand::MEDIUM) return WS_NASAMS;
+  return WS_PATRIOT;
+#else
+  if (airframe == AirframeClass::HELICOPTER) return WS_AVENGER;
+  if (airframe == AirframeClass::UAV && isLowBand(band)) return WS_SHORAD;
+  if (airframe == AirframeClass::FIXED_WING && isLowBand(band)) {
+    // Prefer the area-defense reference once the contact is beyond the
+    // short-range system's published reach.
+    return (distanceKm > 8.0) ? WS_NASAMS : WS_AVENGER;
+  }
+  return WS_PATRIOT;
+#endif
+}
+
+// Is the contact inside the selected system's published envelope? Range and
+// ceiling only -- the honest limit of what open figures support.
+Envelope classifyEnvelope(const WeaponSystemRecord& w, double distanceKm,
+                          float altitudeFt, bool haveAlt, bool valid) {
+  if (!valid || !isfinite(distanceKm)) return Envelope::NO_DATA;
+  if (distanceKm > w.maxRangeKm)       return Envelope::TOO_FAR;
+  if (distanceKm < w.minRangeKm)       return Envelope::TOO_CLOSE;
+  if (haveAlt && isfinite(altitudeFt) && altitudeFt > w.ceilingKft * 1000.0f)
+    return Envelope::ALT_OUT;
+  return Envelope::INSIDE;
+}
+
+// Notional time to intercept: straight-line range at the published average
+// missile speed, plus the system's reaction time. Ignores lead pursuit,
+// boost/coast profile and every other real factor -- it is a plausible-looking
+// number for a desk display, not a time-of-flight prediction.
+bool calcInterceptSeconds(const WeaponSystemRecord& w, double distanceKm,
+                          Envelope env, float& outSec) {
+  if (env != Envelope::INSIDE || w.missileSpeedMps == 0) return false;
+  float t = (float)(distanceKm * 1000.0) / (float)w.missileSpeedMps + w.reactionS;
+  if (!isfinite(t)) return false;
+  outSec = t;
+  return true;
+}
+
+// PK is invented. There is no public dataset that would let anyone compute a
+// real probability of kill, so rather than dress a fabricated constant up as
+// fact this is an explicit geometric heuristic: best mid-envelope, degraded
+// near the edges, at the ceiling, and off-aspect. Displayed as NOTIONAL.
+bool calcPk(const WeaponSystemRecord& w, double distanceKm, float altitudeFt,
+            bool haveAlt, ThreatLevel threat, Envelope env, float& outPk) {
+  if (env != Envelope::INSIDE) return false;
+
+  float span = (float)(w.maxRangeKm - w.minRangeKm);
+  if (span <= 0.0f) return false;
+  float into = ((float)distanceKm - w.minRangeKm) / span;    // 0 near, 1 far
+  float rangeFit = 1.0f - fabsf(into - 0.35f) * 1.4f;        // peak just inside
+
+  float altFit = 1.0f;
+  if (haveAlt && isfinite(altitudeFt)) {
+    float ceilFt = w.ceilingKft * 1000.0f;
+    if (ceilFt > 0.0f) altFit = 1.0f - 0.5f * (altitudeFt / ceilFt);
+  }
+
+  float aspectFit = (threat == ThreatLevel::HIGH_THREAT)   ? 1.0f
+                  : (threat == ThreatLevel::MED_THREAT) ? 0.85f : 0.7f;
+
+  float pk = rangeFit * altFit * aspectFit;
+  if (pk < 0.05f) pk = 0.05f;
+  if (pk > 0.95f) pk = 0.95f;
+  if (!isfinite(pk)) return false;
+  outPk = pk;
+  return true;
+}
+
+const char* airframeText(AirframeClass a) {
+  switch (a) {
+    case AirframeClass::FIXED_WING: return "FIXED-WING";
+    case AirframeClass::HELICOPTER: return "HELICOPTER";
+    case AirframeClass::UAV:        return "UAV";
+    default:                        return "UNKNOWN";
+  }
+}
+
+const char* altBandText(AltitudeBand b) {
+  switch (b) {
+    case AltitudeBand::VERY_LOW: return "VERY LOW";
+    case AltitudeBand::LOW_ALT:  return "LOW";
+    case AltitudeBand::MEDIUM:   return "MEDIUM";
+    case AltitudeBand::MED_HIGH: return "MED-HIGH";
+    case AltitudeBand::HIGH_ALT: return "HIGH";
+    default:                     return "UNKNOWN";
+  }
+}
+
+const char* threatText(ThreatLevel t) {
+  switch (t) {
+    case ThreatLevel::LOW_THREAT:    return "LOW";
+    case ThreatLevel::MED_THREAT: return "MEDIUM";
+    case ThreatLevel::HIGH_THREAT:   return "HIGH";
+    default:                  return "UNKNOWN";
+  }
+}
+
+const char* envelopeText(Envelope e) {
+  switch (e) {
+    case Envelope::INSIDE:    return "IN";
+    case Envelope::TOO_FAR:   return "OUT-FAR";
+    case Envelope::TOO_CLOSE: return "OUT-MIN";
+    case Envelope::ALT_OUT:   return "OUT-ALT";
+    default:                  return "---";
+  }
+}
+
+// Format the SOLUTION field: R/L/C prefix, or "---.-" with no valid track.
+void formatSolution(char* buf, size_t n, bool valid, float deg) {
+  if (!valid)                snprintf(buf, n, "---.-");
+  else if (fabsf(deg) < 0.05f) snprintf(buf, n, "C000.0");
+  else snprintf(buf, n, "%c%05.1f", deg > 0.0f ? 'R' : 'L', fabsf(deg));
+}
+
+// ---------------------------------------------------------------------------
 // Drawing helpers
 // ---------------------------------------------------------------------------
 // Tactical header: title + screen index on the left, NTP clock on the right.
@@ -1346,6 +1659,89 @@ void screenSystem() {
   u8g2.drawStr(18, 62, l);
 }
 
+// WEAPONS SYSTEM. One static page, no animation. Everything is drawn in the
+// 4x6 font (32 chars across) so nine rows fit under the header without wrap.
+void screenWeapons() {
+  drawHeader("WEAPONS");
+
+  // Stale data must not carry the previous contact's solution forward.
+  bool fresh = nearest.valid && lastDataMs != 0 &&
+               (uint32_t)(millis() - lastDataMs) < TRACK_STALE_MS;
+
+  int   cat     = fresh ? effectiveCategory(nearest) : 0;
+  AirframeClass af = fresh ? classifyAirframe(cat) : AirframeClass::UNKNOWN;
+
+  bool  haveAlt = fresh && !nearest.onGround && isfinite(nearest.altitudeM);
+  float altFt   = haveAlt ? nearest.altitudeM * 3.28084f : NAN;
+  AltitudeBand band = classifyAltitude(altFt, haveAlt);
+
+  ThreatLevel threat = classifyThreat(nearest.bearingDeg, nearest.trackDeg,
+                                      nearest.distanceKm, altFt, haveAlt, fresh);
+
+  uint8_t wsIdx = selectWeaponSystem(af, band, fresh ? nearest.distanceKm : 0.0);
+  WeaponSystemRecord w;
+  loadWeapon(wsIdx, w);
+
+  Envelope env = classifyEnvelope(w, nearest.distanceKm, altFt, haveAlt, fresh);
+
+  float solDeg = 0.0f;
+  bool  solOk  = fresh && calculateTrackLeadDeg(HOME_LAT, HOME_LON,
+                                                nearest.lat, nearest.lon,
+                                                nearest.trackDeg, nearest.velocityMs,
+                                                TRACK_LOOKAHEAD_SECONDS, solDeg);
+
+  float tof = 0.0f, pk = 0.0f;
+  bool  tofOk = calcInterceptSeconds(w, nearest.distanceKm, env, tof);
+  bool  pkOk  = calcPk(w, nearest.distanceKm, altFt, haveAlt, threat, env, pk);
+
+  char line[36], des[12], nam[16], brn[14], rol[16], sol[10];
+  copyPgm(des, sizeof(des), w.designation);
+  copyPgm(nam, sizeof(nam), w.name);
+  copyPgm(brn, sizeof(brn), w.branch);
+  copyPgm(rol, sizeof(rol), w.role);
+  formatSolution(sol, sizeof(sol), solOk, solDeg);
+
+  u8g2.setFont(u8g2_font_4x6_tr);
+
+  snprintf(line, sizeof(line), "AIRFRAME: %s", airframeText(af));
+  u8g2.drawStr(0, 15, line);
+  snprintf(line, sizeof(line), "ALT BAND: %s", altBandText(band));
+  u8g2.drawStr(0, 21, line);
+
+  // Threat left, firing authorization right. Authorization is unconditionally
+  // denied: every contact here is friendly and nothing is armed.
+  snprintf(line, sizeof(line), "THREAT: %s", threatText(threat));
+  u8g2.drawStr(0, 27, line);
+  u8g2.drawStr(128 - u8g2.getStrWidth("AUTH:HOLD"), 27, "AUTH:HOLD");
+
+  snprintf(line, sizeof(line), "SOLUTION: %s", sol);
+  u8g2.drawStr(0, 33, line);
+
+  if (fresh)
+    snprintf(line, sizeof(line), "ENV %s  RNG %03d/%03dKM",
+             envelopeText(env), (int)(nearest.distanceKm + 0.5), w.maxRangeKm);
+  else
+    snprintf(line, sizeof(line), "ENV ---  RNG ---/%03dKM", w.maxRangeKm);
+  u8g2.drawStr(0, 39, line);
+
+  if (tofOk && pkOk)
+    snprintf(line, sizeof(line), "TOF %03ds  PK %.2f NOTNL", (int)(tof + 0.5f), pk);
+  else if (tofOk)
+    snprintf(line, sizeof(line), "TOF %03ds  PK ---", (int)(tof + 0.5f));
+  else
+    snprintf(line, sizeof(line), "TOF ---   PK ---");
+  u8g2.drawStr(0, 45, line);
+
+  u8g2.drawHLine(0, 48, 128);
+
+  snprintf(line, sizeof(line), "MATCH: %s", des);
+  u8g2.drawStr(0, 57, line);
+  u8g2.drawStr(128 - u8g2.getStrWidth(rol), 57, rol);
+
+  snprintf(line, sizeof(line), "%s / %s", nam, brn);
+  u8g2.drawStr(0, 63, line);
+}
+
 void render() {
   u8g2.clearBuffer();
   switch (screen) {
@@ -1354,6 +1750,7 @@ void render() {
     case 2: screenRadar();   break;
     case 3: screenWeather(); break;
     case 4: screenSystem();  break;
+    case 5: screenWeapons(); break;
   }
   u8g2.sendBuffer();
 }

@@ -113,6 +113,66 @@
 #define BUZZER_QUIET_START  22
 #define BUZZER_QUIET_END     5
 
+// ---- WEAPONS SYSTEM page -------------------------------------------------
+// A themed air-defense reference display over the ADS-B data already fetched.
+// Every contact is treated as FRIENDLY and firing authorization is always
+// denied (WEAPONS HOLD) -- the page classifies and displays, it does not
+// engage anything and is not connected to anything.
+//
+// Envelope and time-of-flight come from approximate published reference
+// figures for each system. PK is a transparent geometric heuristic, not a real
+// lethality estimate -- there is no public data from which one could be
+// computed, so it is labelled NOTIONAL on screen.
+
+// Look-ahead used by the SOLUTION track-lead angle.
+#define TRACK_LOOKAHEAD_SECONDS  30
+
+// Below this ground speed a track has no meaningful heading, so no solution.
+#define TRACK_MIN_SPEED_MS  10.0
+
+// How old the last fetch may be before the solution blanks to "---.-".
+// NOTE: deliberately larger than UPDATE_INTERVAL_MS (60 s). The obvious 30 s
+// would mark the data stale for the second half of every single poll cycle,
+// so the page would show "---.-" roughly half the time on a working device.
+// 1.5 poll intervals means one missed fetch blanks it, which is the intent.
+#define TRACK_STALE_MS  90000
+
+// Which service's reference systems to prefer. 0 = Army, 1 = Navy, 2 = Marine
+// expeditionary site.
+#define DEFENSE_THEME_ARMY    0
+#define DEFENSE_THEME_NAVY    1
+#define DEFENSE_THEME_MARINE  2
+#define DEFENSE_THEME  DEFENSE_THEME_MARINE
+
+// THREAT gates. Aspect is how directly the contact tracks over the device
+// (0 deg = straight at you); range is SLANT range, so altitude counts -- a jet
+// at FL350 overhead is 10.7 km away and will never rate HIGH, which is the
+// point. HIGH additionally requires a known altitude.
+//
+// HIGH is meant to mean "close enough to read markings". Note the floor is set
+// by the poll rate, not by eyesight: true naked-eye tail-number range is more
+// like 0.3-0.5 km, but at 250 km/h an aircraft crosses a 0.5 km bubble in ~14 s,
+// so a 60 s poll would miss it roughly three times in four. 3 km keeps it
+// inside for ~1.4 min, which one sample per minute reliably catches. Tighten
+// it if you would rather have rare-but-accurate than dependable.
+// Slant range alone is not enough for HIGH: a 3 km slant admits anything below
+// ~9800 ft when it is directly overhead, which is far past reading markings.
+// This cap is what actually enforces "low", and the slant gate then enforces
+// "close". Both must hold.
+#define THREAT_HIGH_MAX_FT      5000
+#define THREAT_HIGH_SLANT_KM     3.0
+#define THREAT_HIGH_ASPECT_DEG  30.0
+#define THREAT_MED_SLANT_KM     10.0
+#define THREAT_MED_ASPECT_DEG   60.0
+
+// Altitude band edges (feet). UI categories only -- not engagement limits.
+// VERY LOW exists because a device sitting under an approach path sees most of
+// its traffic below 10000 ft, and one band there discriminates nothing.
+#define ALT_VLOW_MAX_FT    5000
+#define ALT_LOW_MAX_FT    10000
+#define ALT_MED_MAX_FT    30000
+#define ALT_HIGH_MAX_FT   60000
+
 // ---- OLED wiring (I2C, 4-pin panel -- the default build) -----------------
 // NON-STANDARD PINS: D7/D5 instead of the ESP8266 defaults D2/D1, because the
 // 7-pin SPI panel this project started with already had wires on those two
