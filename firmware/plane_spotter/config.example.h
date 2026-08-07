@@ -21,10 +21,16 @@
 // (but more RAM used; on a quiet sky raise it, if it reboots lower it).
 #define SEARCH_RADIUS_DEG  1.0
 
-// How often to poll OpenSky, in milliseconds. Anonymous access has a small
-// daily budget (~400 calls): 60 s already exceeds it over 24 h, so for
-// continuous use set OPENSKY_USER/PASS below (a free account = far more calls).
-#define UPDATE_INTERVAL_MS  60000
+// How often to poll OpenSky, in milliseconds.
+//
+// Cost is 1 credit per request at this box size: 0.4 x 0.4 deg = 0.16 sq deg,
+// and OpenSky charges 1 credit below 25 sq deg. The daily budget is ~400
+// credits anonymous, 4000 with the OAuth2 client below. So 30 s = 2880
+// calls/day, ~72% of the registered budget with slack for reboots (each one
+// re-fetches immediately). 25 s (86%) is the practical floor; 20 s exceeds it.
+// Below ~10 s there is nothing to gain -- state vectors are served at 5 s
+// resolution, so faster polling just buys duplicate data.
+#define UPDATE_INTERVAL_MS  30000
 
 // Compass heading (deg, 0=N 90=E 180=S 270=W) that the wall / device faces.
 // Used by the radar screen to mark the wall direction.
@@ -55,21 +61,24 @@
 // off ADS-B -- kept generously longer than LOITER_MIN_MS so a brief ADS-B
 // coverage gap does not reset an orbit that is already accumulating.
 //
-// Detection is sampled at the poll rate, so LOITER_MIN_MS is really "this many
-// UPDATE_INTERVAL_MS samples in a row". Two samples is the practical floor:
-// one sample decides off a single displacement, and a helicopter cruising
-// ~200 km/h only just clears the 3 km radius in 60 s, so a slower transit
-// would false-positive. It matters more than it looks, because categoryFrom()
-// *guesses* rotorcraft for anything under 120 km/h when OpenSky omits the
-// category -- those are slow by definition and would latch instantly at one
-// sample. By two samples even a 120 km/h target is 4 km out and re-anchors.
+// Two separate floors constrain LOITER_MIN_MS, and the tighter one wins.
 //
-// To detect faster you have to change the input, not this number: either poll
-// harder (UPDATE_INTERVAL_MS, costs OpenSky quota) or discriminate on track
-// swing rather than displacement, since an orbiting aircraft sweeps heading
-// through 360 deg while a transit holds it steady.
+// Sampling: it is really "this many UPDATE_INTERVAL_MS samples in a row", so
+// at least two are needed. At a 30 s poll that floor is only 60 s.
+//
+// Geometry: the threshold must be long enough that a slow *transit* leaves the
+// anchor radius, or it latches on aircraft merely passing through. This is the
+// binding one. A 120 km/h contact -- the fastest thing categoryFrom() will
+// guess as a rotorcraft when OpenSky omits the category -- covers just 2.0 km
+// in 60 s, still inside the 3 km radius, so a 60 s threshold false-latches on
+// it. At 120 s it is 4.0 km out and correctly re-anchors.
+//
+// So faster polling does NOT shorten this. It buys robustness instead: 120 s is
+// 4 samples at a 30 s poll rather than 2, so one bad position report no longer
+// decides the outcome. To genuinely go faster you would have to shrink
+// LOITER_RADIUS_KM, which risks re-anchoring on wide orbits.
 #define LOITER_RADIUS_KM  3.0
-#define LOITER_MIN_MS     120000   // 2 min (= 2 polls at the default 60 s)
+#define LOITER_MIN_MS     120000   // 2 min (= 4 polls at the default 30 s)
 #define HELI_EXPIRE_MS    300000   // 5 min
 
 // ---- Piezo buzzer (rotorcraft alerts) ------------------------------------
@@ -131,11 +140,9 @@
 #define TRACK_MIN_SPEED_MS  10.0
 
 // How old the last fetch may be before the solution blanks to "---.-".
-// NOTE: deliberately larger than UPDATE_INTERVAL_MS (60 s). The obvious 30 s
-// would mark the data stale for the second half of every single poll cycle,
-// so the page would show "---.-" roughly half the time on a working device.
-// 1.5 poll intervals means one missed fetch blanks it, which is the intent.
-#define TRACK_STALE_MS  90000
+// Kept at ~1.5 poll intervals, so one genuinely missed fetch blanks it while a
+// healthy device never does. Retune this alongside UPDATE_INTERVAL_MS.
+#define TRACK_STALE_MS  45000
 
 // Which service's reference systems to prefer. 0 = Army, 1 = Navy, 2 = Marine
 // expeditionary site.
@@ -149,18 +156,14 @@
 // at FL350 overhead is 10.7 km away and will never rate HIGH, which is the
 // point. HIGH additionally requires a known altitude.
 //
-// HIGH is meant to mean "close enough to read markings". Note the floor is set
-// by the poll rate, not by eyesight: true naked-eye tail-number range is more
-// like 0.3-0.5 km, but at 250 km/h an aircraft crosses a 0.5 km bubble in ~14 s,
-// so a 60 s poll would miss it roughly three times in four. 3 km keeps it
-// inside for ~1.4 min, which one sample per minute reliably catches. Tighten
-// it if you would rather have rare-but-accurate than dependable.
-// Slant range alone is not enough for HIGH: a 3 km slant admits anything below
-// ~9800 ft when it is directly overhead, which is far past reading markings.
-// This cap is what actually enforces "low", and the slant gate then enforces
-// "close". Both must hold.
-#define THREAT_HIGH_MAX_FT      5000
-#define THREAT_HIGH_SLANT_KM     3.0
+// HIGH is meant to mean "close enough to read markings". The floor is set by
+// the poll rate, not eyesight: a pass is only guaranteed to be sampled if the
+// contact stays inside the bubble longer than one poll interval. At 250 km/h a
+// 1.5 km bubble is a 43 s dwell -- missable at a 60 s poll, guaranteed at 30 s.
+// True naked-eye tail-number range is nearer 0.3-0.5 km, but that is a 14 s
+// dwell and would be missed most passes at any poll rate we can afford.
+#define THREAT_HIGH_MAX_FT      3000
+#define THREAT_HIGH_SLANT_KM     1.5
 #define THREAT_HIGH_ASPECT_DEG  30.0
 #define THREAT_MED_SLANT_KM     10.0
 #define THREAT_MED_ASPECT_DEG   60.0
