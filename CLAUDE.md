@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ESP8266 firmware driving a 0.96" SSD1306 OLED as a desk "radar" for ADS-B
 aircraft. It polls OpenSky for aircraft near a fixed home coordinate, picks the
-closest one, and cycles five screens. Weather, airline/route lookup and an NTP
+closest one, and cycles six screens. Weather, airline/route lookup and an NTP
 clock are secondary data sources. Everything is one Arduino sketch; the repo has
 no test suite and no host build (but see *Testing logic on the host* below).
 
@@ -75,15 +75,24 @@ needed; they are cheap to recreate and brittle against reordering.
 
 `firmware/plane_spotter/plane_spotter.ino` is the whole program (~1460 lines),
 organized top-to-bottom as: display constructor → data structs → math helpers →
-rotorcraft tracking → network fetchers → buzzer → drawing primitives → five
-`screenX()` functions → `render()` → `setup()`/`loop()`.
+rotorcraft tracking → network fetchers → buzzer → weapons/classification →
+drawing primitives → six `screenX()` functions → `render()` → `setup()`/`loop()`.
 
 `loop()` is a cooperative scheduler on `millis()` deltas, no RTOS or timers. It
 runs at ~30 fps (`delay(33)`) so the radar sweep animates and the clock ticks,
 while network fetches happen on much slower independent intervals
-(`UPDATE_INTERVAL_MS` 60 s for aircraft, `WEATHER_INTERVAL_MS` 10 min). Screen
+(`UPDATE_INTERVAL_MS` 30 s for aircraft, `WEATHER_INTERVAL_MS` 10 min). Screen
 rotation is driven by a per-screen dwell table, `SCREEN_SWAP_MS[]`, not a
 uniform interval.
+
+The poll rate is a budget decision, not a free knob. OpenSky charges 1 credit
+per request at this bounding-box size (0.16 sq°, under the 25 sq° tier), against
+~400/day anonymous or 4000/day with the OAuth2 client. 30 s is ~72% of the
+registered budget; 25 s is the practical floor and 20 s exceeds it. Below ~10 s
+there is nothing to gain — state vectors are served at 5 s resolution. Check
+real headroom with the `x-rate-limit-remaining` response header rather than
+guessing. `TRACK_STALE_MS` is pinned at ~1.5 poll intervals and must be retuned
+alongside it.
 
 Rendering is full-frame: `render()` clears a full 1 KB U8g2 buffer, dispatches on
 the `screen` index, and sends the whole buffer. All drawing goes through the
@@ -91,7 +100,7 @@ bus-agnostic U8g2 API, so the SPI/I²C choice touches only the constructor.
 
 Two pieces of state decouple the fast render loop from the slow fetch loop:
 `nearest` (the single closest `Aircraft`, fully populated) and `blips[]` (up to
-`MAX_BLIPS` 20 lightweight lat/lon/track/speed records). Because fetches are 60 s
+`MAX_BLIPS` 20 lightweight lat/lon/track/speed records). Because fetches are 30 s
 apart but the radar redraws 30×/s, `screenRadar()` dead-reckons every blip
 forward from `lastDataMs` via `projectLatLon()` — blips visibly creep between
 fetches. Anything added to the radar needs the same treatment or it will look
@@ -149,12 +158,18 @@ holds an anchor position per airframe: stay within `LOITER_RADIUS_KM` for
 `LOITER_MIN_MS` and it latches as loitering; drift outside and the anchor resets,
 because that is transit rather than orbit.
 
-`LOITER_MIN_MS` is effectively a **count of polls**, not a duration — detection
-is sampled at `UPDATE_INTERVAL_MS`. Two samples is the floor. One sample decides
-off a single displacement, and `categoryFrom()` guesses rotorcraft for anything
-under 120 km/h when OpenSky omits the category, so slow traffic would latch
-immediately. Detecting faster means changing the input (poll harder, or
-discriminate on track swing rather than displacement), not lowering the number.
+**Two floors constrain `LOITER_MIN_MS`, and the geometric one binds.** The
+obvious floor is sampling: it is a count of `UPDATE_INTERVAL_MS` samples, so at
+least two. But the threshold must also outlast a slow *transit* crossing the
+anchor radius, or it latches on aircraft merely passing through — and that is
+the tighter limit. A 120 km/h contact (the fastest thing `categoryFrom()` will
+guess as a rotorcraft) covers only 2.0 km in 60 s, still inside the 3 km radius,
+so a 60 s threshold false-latches; at 120 s it is 4.0 km out and re-anchors.
+
+Faster polling therefore does **not** shorten this — it only buys robustness
+(120 s is 4 samples at a 30 s poll, not 2). Going genuinely faster means
+shrinking `LOITER_RADIUS_KM`, which risks re-anchoring on wide orbits, or
+discriminating on track swing rather than displacement.
 
 ### Buzzer
 
@@ -193,6 +208,48 @@ free in both display builds.
 
 `BUZZER_ENABLE`, `BUZZER_ACTIVE_LOW` and `BUZZER_SWEEP_BLIP` are independent
 compile-time switches — check the combinations still build when touching this.
+
+### Threat gating
+
+`classifyThreat()` scores aspect (how directly the contact tracks over the
+device) against **slant** range, not ground distance — altitude is most of how
+far away an aircraft is, and on ground distance alone a jet at FL350 overhead
+scored the same as a Cessna at 2000 ft on the same track.
+
+HIGH additionally needs a known altitude under `THREAT_HIGH_MAX_FT`. The slant
+gate alone is not enough: 3 km admits anything below ~9800 ft when overhead, so
+the ceiling is what actually enforces "low" while slant enforces "close".
+
+`THREAT_HIGH_SLANT_KM` has a floor set by the poll rate, not by eyesight: a pass
+is only guaranteed to be sampled if the contact dwells inside the bubble longer
+than one poll interval. At 250 km/h a 1.5 km bubble is a 43 s dwell — missable
+at 60 s polling, guaranteed at 30 s. Real naked-eye tail-number range (~0.3–0.5
+km) is a 14 s dwell and would be missed on most passes at any affordable rate.
+Retune this whenever `UPDATE_INTERVAL_MS` changes.
+
+### WEAPONS SYSTEM page
+
+A themed air-defense reference display (screen 6) layered over the same ADS-B
+data. It classifies the nearest contact, picks a system from a PROGMEM table,
+and shows a track-lead angle plus notional envelope figures.
+
+Scope is deliberate and should stay that way: every contact is FRIENDLY,
+`AUTH:HOLD` is unconditional, and nothing is connected to anything. Envelope and
+time-of-flight use published reference figures; **PK is an invented geometric
+heuristic** labelled `NOTNL`, because no public data supports a real one. No
+no-escape-zone or doctrinal engagement data is represented, for the same reason.
+`SOLUTION` is a bearing delta over `TRACK_LOOKAHEAD_SECONDS`, not a firing
+solution.
+
+Two traps live here. **`LOW` and `HIGH` are Arduino macros** — the preprocessor
+rewrites them even inside an `enum class`, so `AltitudeBand::LOW` silently
+became `AltitudeBand::0`; the enumerators are `LOW_ALT`/`HIGH_ALT` for that
+reason alone. And the Arduino builder emits prototypes *above* the sketch body,
+so any type used in a signature must be declared near the top of the file, which
+is why the enums and `WeaponSystemRecord` sit up with the data model.
+
+Rows are 4x6 (32 columns). When editing the layout, regenerate the line-width
+audit rather than eyeballing it — the longest current line is 30 columns.
 
 ### Type icons
 
