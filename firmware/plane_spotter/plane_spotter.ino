@@ -455,7 +455,14 @@ bool fetchAircraft() {
   HTTPClient https;
   https.setReuse(false);
   String url = buildUrl();
+#if LOG_REQUEST_URL
   Serial.printf("[fetch] heap=%u GET %s\n", ESP.getFreeHeap(), url.c_str());
+#else
+  // Deliberately omits the bounding box -- it is centred on the configured home
+  // position, so logging it would publish the device's location every fetch.
+  Serial.printf("[fetch] heap=%u GET states/all (%.1f deg box)\n",
+                ESP.getFreeHeap(), (double)(SEARCH_RADIUS_DEG * 2.0));
+#endif
   if (!https.begin(client, url)) {
     Serial.println("[fetch] https.begin() failed");
     stats.requestsFail++;

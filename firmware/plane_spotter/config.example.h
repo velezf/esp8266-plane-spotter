@@ -43,6 +43,13 @@
 // How often to refresh weather from Open-Meteo (ms). 10 min is plenty.
 #define WEATHER_INTERVAL_MS  600000
 
+// Log the full OpenSky request URL on every fetch. Off by default: the URL
+// carries the search bounding box, which is centred on HOME_LAT/HOME_LON, so
+// averaging its bounds recovers the device position to ~11 m. That would put
+// your coordinates into every routine log line and into any log you paste
+// somewhere. Turn on only while debugging the request itself.
+#define LOG_REQUEST_URL  0
+
 // ---- OpenSky OAuth2 client (optional) ------------------------------------
 // Leave both empty for anonymous access (small ~400 calls/day budget). For a
 // much larger quota, create a free account at https://opensky-network.org/,
