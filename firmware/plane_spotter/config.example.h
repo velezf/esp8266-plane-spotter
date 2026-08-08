@@ -129,6 +129,26 @@
 #define BUZZER_QUIET_START  22
 #define BUZZER_QUIET_END     5
 
+// ---- Aircraft identity lookup --------------------------------------------
+// OpenSky almost never populates the emitter category, so airframe type has to
+// be guessed from speed and altitude. These lookups resolve the *nearest*
+// contact's registration and ICAO type code by icao24, which classifies it
+// exactly (an R22 is a helicopter, no guessing) and puts a tail number on
+// screen. Positions always come from OpenSky -- this is identity only.
+//
+// Three tiers, tried in order and cached per airframe, so a lookup only fires
+// when the nearest contact changes. Measured coverage over 24 aircraft
+// overhead: hexdb 17/24, +adsbdb 20/24, +adsb.lol 24/24.
+#define AC_LOOKUP_ENABLE  1
+
+// Tier 3 is adsb.lol, a community-run service. It is only queried when both
+// databases miss (~17% of contacts), so it sees a handful of requests an hour.
+// If it ever rate-limits or goes away, set this to 0: the chain degrades to
+// tier 2, then to the kinematic guess, and nothing on screen breaks.
+// Note it is a live-feed query, not a database -- it only knows aircraft that
+// are currently airborne, which is exactly when a contact is nearest.
+#define AC_LOOKUP_TIER3   1
+
 // ---- WEAPONS SYSTEM page -------------------------------------------------
 // A themed air-defense reference display over the ADS-B data already fetched.
 // Every contact is treated as FRIENDLY and firing authorization is always

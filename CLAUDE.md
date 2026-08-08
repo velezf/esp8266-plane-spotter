@@ -18,8 +18,10 @@ All commands run from `firmware/`, or use `-d firmware` from the repo root.
 ```bash
 pio run                                        # compile
 pio run -t upload                              # compile + flash (auto-detect port)
-pio run -t upload --upload-port /dev/cu.usbserial-110
+pio run -t upload --upload-port /dev/cu.usbserial-120
 pio device list                                # find the board (CH340 = VID:PID 1A86:7523)
+# NB: macOS renumbers the CH340 port on re-plug (usbserial-110 -> -120 ...).
+# If upload fails with "No such file or directory", re-run device list.
 pio device monitor -b 115200                   # serial, 115200
 pio run -t clean
 ```
@@ -47,8 +49,8 @@ while time.time() < end:
 
 Expect ~200 ms of binary garbage at boot — that is the ESP8266 bootloader
 talking at 74880 baud, not a fault. A healthy boot logs `[oled]`, `[buzz]`,
-`[wifi]`, `[auth]`, `[fetch]`, `[wx]` and, when a helicopter is around,
-`[heli]` and `[route]`.
+`[wifi]`, `[auth]`, `[fetch]`, `[wx]`, `[route]`, `[acid]` and, when a
+helicopter is around, `[heli]`.
 
 The Arduino IDE also works (`firmware/plane_spotter/plane_spotter.ino`) with
 U8g2 + ArduinoJson installed by hand; PlatformIO pins those in
@@ -217,6 +219,27 @@ free in both display builds.
 
 `BUZZER_ENABLE`, `BUZZER_ACTIVE_LOW` and `BUZZER_SWEEP_BLIP` are independent
 compile-time switches — check the combinations still build when touching this.
+
+### Aircraft identity lookup
+
+OpenSky almost never populates the emitter category (`cat=0`), which is why
+`categoryFrom()` guesses airframe type from speed and altitude. `fetchAircraftInfo()`
+resolves the **nearest contact only** by icao24 through three tiers — hexdb.io,
+then adsbdb.com, then adsb.lol — giving a registration and an ICAO type code.
+A type code is hard identity, so `classifyAirframeFrom()` prefers it over the
+category and the kinematic guess becomes the fallback rather than the primary
+path. Measured coverage over 24 aircraft overhead: 17/24, 20/24, 24/24.
+
+**Positions never come from anywhere but OpenSky.** That is the whole point of
+the split: tier 3 is a community-run service, and if it rate-limits or vanishes
+the chain degrades to tier 2, then to the guess, and nothing on screen breaks.
+Keep it that way — moving the *feed* to a best-effort endpoint would mean a 429
+blanks the entire display. `AC_LOOKUP_TIER3` turns it off.
+
+Results are cached per airframe including negative ones, so an unknown icao24 is
+not re-queried every poll. Tier 3 is plain HTTP, so it skips the 16 KB TLS
+buffer; note it is a *live* query and only knows airborne aircraft — fine here,
+since the nearest contact is airborne by definition.
 
 ### Threat gating
 
