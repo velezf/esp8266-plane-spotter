@@ -290,6 +290,33 @@ practice, so `effectiveCategory()` estimates the aircraft type from altitude and
 speed and marks the guess with a leading `~` (e.g. `~Small`). Real categories,
 when present, are used unmodified.
 
+### Missing data is NAN, never 0
+
+OpenSky leaves velocity (9) and both altitudes (7, 13) null often enough that
+this is a hot path, not an edge case. **Parse them as `NAN` when null**, which is
+the sentinel the threat and weapons layer already tests for with `isfinite()` —
+there are a dozen such guards, and defaulting to `0.0f` in the fetch made every
+one of them dead code.
+
+The bug this caused is the reason to keep it that way. `categoryFrom()` guesses
+"helicopter" from *slow and low*, so a contact with null velocity and altitude
+read as 0 km/h at 0 m and guessed rotorcraft. A poll where most vectors were
+incomplete drew the entire radar as rotorcraft crosses, and — worse, because it
+outlives the poll — fed airliners into `helis[]`, where they refresh their own
+`lastSeenMs` every fetch, never expire, crowd out the `MAX_HELI` 4 slots, and can
+latch as *loitering*. `categoryFrom()` therefore returns `0` (unknown) rather
+than guessing when either input is not finite.
+
+Anything reading these fields must handle `NAN`. The display sites in
+`screenNearest()` show `alt --` / `--` km/h rather than printing `nan`; the
+dead-reckoning and track-lead paths already guarded correctly, since `NAN > 0` is
+false.
+
+Note the identity tiers do **not** rescue this. `classifyAirframeFrom()` prefers a
+resolved ICAO type code over the guess, but `fetchAircraftInfo()` only ever runs
+on the nearest contact — so the other 19 blips, and `trackRotorcraft()` at fetch
+time, have nothing but the kinematic guess to go on.
+
 ## Workflow
 
 **Ask before `git commit` or `git push`.** An instruction about *where* work
@@ -316,17 +343,23 @@ pins ArduinoJson ^7.0.4), so do not merge it into `main`.
 
 ## Unverified on hardware
 
-Two things are written, merged and building, but have never actually run:
+**Buzzer hardware is now verified.** A 3-pin module is wired on D6/GPIO12 and a
+boot self-test sounded all three voices (4000 / 3000 / 2200 Hz) cleanly, then
+went silent. So the PNP/S9012 assumption holds — `BUZZER_ACTIVE_LOW 1` is
+correct, and the by-hand `BUZZER_IDLE_LEVEL` restore does prevent the `noTone()`
+drone. Do not re-litigate the polarity; it is settled on this hardware.
 
-- **Rotorcraft rendering** (cross marker, TARGET banner, doubled dwell) — the
-  loiter state machine is host-tested, but nothing has been seen on the panel,
-  because it needs a helicopter in range. Watch for `[heli] new contact` and
-  `[heli] … loitering` on serial.
-- **The buzzer, entirely** — no buzzer was wired when it was written, and the
-  board has not been flashed with it. The polarity assumption is the thing most
-  likely to be wrong: if it drones continuously from power-up, flip
-  `BUZZER_ACTIVE_LOW` to 0 and reflash. Boot logs
-  `[buzz] enabled on GPIO12 (active-low), …`.
+What remains untested needs a helicopter within `BUZZER_RANGE_KM` and cannot be
+forced:
 
-The flashed firmware on the board is therefore *older* than `main` — it predates
-the buzzer commits.
+- **Rotorcraft rendering** — cross marker, TARGET banner, doubled dwell. The
+  loiter state machine is host-tested, but nothing has been seen on the panel.
+- **The buzzer *trigger* paths** — sweep tick, two-tone acquisition, loiter
+  triple. The element is proven; what calls it is not.
+
+Watch for `[heli] new contact` and `[heli] … loitering` on serial. Note the
+rotorcraft misclassification bug (see *Missing data is NAN*) meant earlier
+`rotor=N` counts and `[heli]` lines could not be trusted — sightings before that
+fix do not count as evidence either way.
+
+The board is flashed from this branch, so it is currently *newer* than `main`.
