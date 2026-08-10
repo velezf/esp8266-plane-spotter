@@ -6,7 +6,10 @@
  * the free OpenSky Network REST API.
  *
  * Board   : any ESP8266 (NodeMCU v2/v3, Wemos D1 mini, ...)
- * Display : 0.96" OLED I2C, SSD1306 128x64 (4 pins: GND, VCC, SCL, SDA)
+ * Display : 128x64 OLED, I2C or SPI. Two controllers are supported and both
+ *           are the same pixel grid, so the layouts are identical:
+ *             - SSD1309, 2.42" (the current build -- DISPLAY_SSD1309 1)
+ *             - SSD1306, 0.96" (DISPLAY_SSD1309 0)
  *
  * Wiring (default, see README for the full table):
  *   OLED      ESP8266 (NodeMCU label / GPIO)
@@ -62,17 +65,64 @@
 // ---------------------------------------------------------------------------
 #define DISPLAY_I2C 1   // flip to 0 and reflash if you swap back to an SPI panel
 
+// Controller, independent of the bus above. Both panels are 128x64, so every
+// layout is unchanged between them -- the 2.42" is the same pixel grid at ~2.5x
+// the linear size, not more pixels. All four bus/controller combinations
+// compile; check them when touching this block.
+//   0 = SSD1306, the 0.96" panel
+//   1 = SSD1309, the 2.42" panel (HiLetgo and similar, I2C 4-pin or SPI 7-pin)
+#define DISPLAY_SSD1309 1
+
+// SSD1309 init variant. These modules ship with one of two init sequences and
+// the datasheet does not tell you which. If the panel stays dark but the I2C
+// probe finds it (see the [oled] boot log), flip this before suspecting wiring.
+//   0 = NONAME0 (try first), 1 = NONAME2
+#define SSD1309_NONAME2 0
+
+// Reset line. The 0.96" panel has none, so U8g2 gets U8X8_PIN_NONE. The 2.42"
+// module breaks RES out even in I2C mode and generally wants a real reset
+// pulse -- set PIN_OLED_RST_I2C in config.h to the GPIO you wired it to, or
+// leave it at -1 to run without one.
+#if DISPLAY_SSD1309 && PIN_OLED_RST_I2C >= 0
+  #define OLED_RESET_PIN PIN_OLED_RST_I2C
+#else
+  #define OLED_RESET_PIN U8X8_PIN_NONE
+#endif
+
 #if DISPLAY_I2C
 // Constructor args: (rotation, reset, clock/SCL, data/SDA).
+#  if DISPLAY_SSD1309
+#    if SSD1309_NONAME2
+U8G2_SSD1309_128X64_NONAME2_F_HW_I2C u8g2(U8G2_R0,
+                                          /*reset=*/ OLED_RESET_PIN,
+                                          /*clock=*/ PIN_OLED_SCL,
+                                          /*data=*/  PIN_OLED_SDA);
+#    else
+U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0,
+                                          /*reset=*/ OLED_RESET_PIN,
+                                          /*clock=*/ PIN_OLED_SCL,
+                                          /*data=*/  PIN_OLED_SDA);
+#    endif
+#  else
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0,
                                          /*reset=*/ U8X8_PIN_NONE,
                                          /*clock=*/ PIN_OLED_SCL,
                                          /*data=*/  PIN_OLED_SDA);
+#  endif
 #else
+// SPI: SCK=GPIO14 and MOSI=GPIO13 are fixed by hardware SPI; CS/DC/RST are not.
+#  if DISPLAY_SSD1309
+#    if SSD1309_NONAME2
+U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI u8g2(U8G2_R0, PIN_OLED_CS, PIN_OLED_DC, PIN_OLED_RST);
+#    else
+U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI u8g2(U8G2_R0, PIN_OLED_CS, PIN_OLED_DC, PIN_OLED_RST);
+#    endif
+#  else
 U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
                                             PIN_OLED_CS,
                                             PIN_OLED_DC,
                                             PIN_OLED_RST);
+#  endif
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2021,7 +2071,8 @@ void setup() {
 #if DISPLAY_I2C
   uint8_t addr = detectOledAddress();
   if (addr) {
-    Serial.printf("[oled] SSD1306 found at 0x%02X on SDA=GPIO%d SCL=GPIO%d\n",
+    Serial.printf("[oled] %s found at 0x%02X on SDA=GPIO%d SCL=GPIO%d\n",
+                  DISPLAY_SSD1309 ? "SSD1309" : "SSD1306",
                   addr, PIN_OLED_SDA, PIN_OLED_SCL);
     u8g2.setI2CAddress(addr << 1);   // U8g2 wants the 8-bit form
   } else {
