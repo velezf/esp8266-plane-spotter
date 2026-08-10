@@ -425,6 +425,11 @@ inline const char* acRegFor(const char*)  { return ""; }
 int categoryFrom(int cat, bool onGround, float velocityMs, float altitudeM) {
   if (cat > 0)  return cat;                   // real data
   if (onGround) return 0;
+  // A missing field is not a slow, low one. OpenSky leaves velocity and both
+  // altitudes null often enough that defaulting them to zero made every such
+  // contact look like a hovering helicopter -- a screen full of crosses, and
+  // airliners latching into helis[]. Without real kinematics, decline to guess.
+  if (!isfinite(velocityMs) || !isfinite(altitudeM)) return 0;
   float kmh = velocityMs * 3.6f;
   if (kmh < 120 && altitudeM < 2200) return 8;  // slow & low -> guess helicopter
   if (kmh < 300 && altitudeM < 5000) return 3;  // medium      -> guess small plane
@@ -685,9 +690,13 @@ bool fetchAircraft() {
 
     // Resolve the type here, while the full state vector is in hand: the radar
     // redraws far too often to re-derive it per frame.
+    // NAN, not 0, for anything OpenSky left null -- that is the sentinel the
+    // threat/weapons layer already tests with isfinite(), and it keeps
+    // "unknown" distinguishable from "stationary at sea level".
     bool  onGround = s[8] | false;
-    float velMs    = s[9] | 0.0f;
-    float altM     = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
+    float velMs    = s[9].isNull() ? NAN : s[9].as<float>();
+    float altM     = s[13].isNull() ? (s[7].isNull() ? NAN : s[7].as<float>())
+                                    : s[13].as<float>();
     int   cat      = categoryFrom(s[17] | 0, onGround, velMs, altM);
 
     bool loiter = false;
@@ -714,9 +723,11 @@ bool fetchAircraft() {
       best.onGround   = s[8] | false;
       best.category   = s[17] | 0;
 
-      // geo altitude (13) preferred, fall back to barometric (7)
-      best.altitudeM  = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
-      best.velocityMs = s[9]  | 0.0f;
+      // geo altitude (13) preferred, fall back to barometric (7), then NAN --
+      // see the note above; isfinite() guards downstream depend on it.
+      best.altitudeM  = s[13].isNull() ? (s[7].isNull() ? NAN : s[7].as<float>())
+                                       : s[13].as<float>();
+      best.velocityMs = s[9].isNull() ? NAN : s[9].as<float>();
       best.trackDeg   = s[10] | 0.0f;
       best.vrateMs    = s[11] | 0.0f;
 
@@ -1589,15 +1600,18 @@ void screenNearest() {
 
   if (nearest.onGround) {
     u8g2.drawStr(0, 54, "on ground");
-  } else {
+  } else if (isfinite(nearest.altitudeM)) {
     snprintf(line, sizeof(line), "%.0f m / FL%03.0f",
              nearest.altitudeM, nearest.altitudeM * 3.28084 / 100.0);
     u8g2.drawStr(0, 54, line);
+  } else {
+    u8g2.drawStr(0, 54, "alt --");
   }
 
   // heading arrow + speed on the right
   drawArrow(110, 34, 11, nearest.trackDeg);
-  snprintf(line, sizeof(line), "%.0f", nearest.velocityMs * 3.6); // km/h
+  if (isfinite(nearest.velocityMs)) snprintf(line, sizeof(line), "%.0f", nearest.velocityMs * 3.6); // km/h
+  else                              snprintf(line, sizeof(line), "--");
   u8g2.setFont(u8g2_font_4x6_tr);
   u8g2.drawStr(98, 56, line);
   u8g2.drawStr(98, 63, "km/h");
@@ -1605,7 +1619,7 @@ void screenNearest() {
   // altitude gauge on the far-right column (0..FL400)
   const int gT = 14, gB = 50;
   u8g2.drawFrame(125, gT, 3, gB - gT);
-  if (!nearest.onGround) {
+  if (!nearest.onGround && isfinite(nearest.altitudeM)) {
     float fl = nearest.altitudeM * 3.28084f / 100.0f;
     float fr = fl / 400.0f;
     if (fr > 1) fr = 1;
