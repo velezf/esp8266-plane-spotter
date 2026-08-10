@@ -148,13 +148,39 @@ ESP8266 `Wire` is a bit-banged software I²C master — any GPIO pair is valid a
 long as the pins reach `Wire.begin()`, which the U8g2 `HW_I2C` backend does when
 the constructor is given a clock/data pair.
 
-`DISPLAY_I2C` (in the sketch) selects the bus: `1` = 4-pin I²C panel (default),
-`0` = the original 7-pin SPI panel using `PIN_OLED_CS/DC/RST` from `config.h`.
-Both paths compile; check both before touching the display block.
+Two independent switches in the sketch, giving four combinations that all
+compile — check the matrix when touching this block:
 
-The panel has no reset line, so reset is `U8X8_PIN_NONE`. `setup()` probes 0x3C
-and 0x3D and calls `setI2CAddress(addr << 1)` — **U8g2 takes the 8-bit address**,
-so 0x3C→0x78 and 0x3D→0x7A. Do not "fix" a 7-bit address into that call.
+- `DISPLAY_I2C` — bus. `1` = I²C (default), `0` = 4-wire hardware SPI using
+  `PIN_OLED_CS/DC/RST` from `config.h`.
+- `DISPLAY_SSD1309` — controller. `1` = SSD1309, the 2.42" panel (**the current
+  hardware**); `0` = SSD1306, the 0.96" panel.
+
+Both panels are 128×64, so **every layout is identical between them**. The 2.42"
+is the same pixel grid at ~2.5× the linear size — it buys legibility, not room.
+That is also why portrait (`U8G2_R1`/`R3`) was rejected: rotating gives 16
+columns at 4x6 instead of 32, which the WEAPONS page cannot fit (its longest
+line is 30), and `screenRadar()` is a hard left/right split — disc at `cx=31`,
+info panel at `px=62`.
+
+**The SSD1309 needs its own init sequence; SSD1306 init is not good enough.**
+This is a trap because it half-works: a panel hot-plugged into an already-running
+board renders fine on SSD1306 init, then comes up wrong after the next cold
+reset, which makes it look like the reflash broke it. If the `[oled]` probe finds
+the panel at 0x3C but the screen is wrong, that is an init problem, not wiring.
+
+`SSD1309_NONAME2` picks between the two init variants these modules ship with
+(`0` = NONAME0, the one that works here; `1` = NONAME2). Try flipping it before
+suspecting hardware.
+
+Reset: the 0.96" has no reset line, so it always passes `U8X8_PIN_NONE`. The
+2.42" breaks `RES` out even in I²C mode — `PIN_OLED_RST_I2C` in `config.h` takes
+the GPIO, or `-1` for none. **`-1` is confirmed working on this hardware**; the
+panel does not in practice need the pulse.
+
+`setup()` probes 0x3C and 0x3D (both controllers use the same pair) and calls
+`setI2CAddress(addr << 1)` — **U8g2 takes the 8-bit address**, so 0x3C→0x78 and
+0x3D→0x7A. Do not "fix" a 7-bit address into that call.
 
 ### Rotorcraft
 

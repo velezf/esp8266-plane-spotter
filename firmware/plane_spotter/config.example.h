@@ -211,9 +211,16 @@
 #define PIN_OLED_SCL  14   // D5
 
 // 7-bit address. Most 0.96" SSD1306 modules are 0x3C, a few are 0x3D; setup()
-// probes for both, so this is only the preferred one to try first.
+// probes for both, so this is only the preferred one to try first. 2.42"
+// SSD1309 modules use the same two addresses.
 #define OLED_I2C_ADDR      0x3C
 #define OLED_I2C_ADDR_ALT  0x3D
+
+// Reset line for an I2C SSD1309 (DISPLAY_SSD1309 1). The 0.96" SSD1306 has no
+// reset pin and ignores this; the 2.42" module breaks RES out even in I2C mode
+// and generally wants a real pulse. Set to the GPIO you wired RES to, or -1 to
+// run without one. Avoid GPIO16 (D0) -- it is off the normal GPIO mux.
+#define PIN_OLED_RST_I2C  -1
 
 // ---- OLED wiring (hardware SPI, only used when DISPLAY_I2C is 0) ---------
 // SCK -> GPIO14 (D5) and SDA/MOSI -> GPIO13 (D7) are fixed by HW SPI.
