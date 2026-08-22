@@ -31,6 +31,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ESP8266HTTPClient.h>
+#include <StreamString.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
 #include <Wire.h>
@@ -690,6 +691,11 @@ bool fetchAircraft() {
     https.addHeader("Authorization", "Bearer " + accessToken);
   }
 
+  // Must be set before the request goes out -- it changes the request line.
+  // HTTP/1.0 means the server cannot use Transfer-Encoding: chunked, which is
+  // what was truncating this fetch; see the note at the parse below.
+  https.useHTTP10(true);
+
   int code = https.GET();
   Serial.printf("[fetch] HTTP %d\n", code);
   if (code != HTTP_CODE_OK) {
@@ -712,16 +718,44 @@ bool fetchAircraft() {
   // OpenSky replies with Transfer-Encoding: chunked. getStream() would hand the
   // raw chunked bytes (hex length markers) to the parser and yield nothing, so
   // we use getString(), which de-chunks the body before we parse it.
-  String payload = https.getString();
-  https.end();
-  Serial.printf("[fetch] payload=%u bytes\n", payload.length());
-
+  // TEMPORARY IncompleteInput DIAGNOSTIC -- remove before committing.
+  // Failures cluster at 987/988 bytes while successes range 846..1645, which
+  // points at a fixed boundary rather than network truncation. Capture the
+  // contiguous-block picture around getString(): ESP8266 String truncates
+  // silently when a realloc cannot find a contiguous block, and the 16 KB TLS
+  // RX buffer allocated just above is exactly what would fragment it.
+  // Parse straight off the socket. Nothing buffers the whole body.
+  //
+  // The old getString() path was truncating ~15% of polls, silently, mid-token.
+  // Root cause is memory pressure inside the chunked decoder: this response is
+  // Transfer-Encoding: chunked, and the core's chunked loop allocates a fresh
+  // String for every chunk header via readStringUntil('\n') -- all while the
+  // 16 KB TLS RX buffer leaves just ~8 KB free and ~5.4 KB contiguous. When an
+  // allocation there fails, bytes-written stops matching bytes-declared and the
+  // loop bails with HTTPC_ERROR_STREAM_WRITE (-10), handing back a partial body.
+  // getString() returns `const String&` and has no error channel, so the only
+  // symptom downstream was a JSON IncompleteInput.
+  //
+  // useHTTP10(true) (set before GET, above) removes the whole failure mode
+  // rather than working around it: HTTP/1.0 has no chunked encoding, so there
+  // are no chunk headers and no per-chunk allocations, and the reply carries a
+  // real Content-Length. That is also what makes streaming safe here -- the old
+  // comment warning that getStream() feeds raw hex length markers to the parser
+  // was true only *because* of chunking. With that gone, ArduinoJson reads the
+  // socket directly and the ~2 KB body String disappears from the heap.
   JsonDocument doc;
   DeserializationError err = deserializeJson(
-      doc, payload, DeserializationOption::Filter(filter));
+      doc, https.getStream(), DeserializationOption::Filter(filter));
+  int bodyLen = https.getSize();
+  https.end();
+
+  Serial.printf("[fetch] body=%d bytes (streamed) heap=%u\n",
+                bodyLen, ESP.getFreeHeap());
 
   if (err) {
-    Serial.printf("[fetch] JSON error: %s\n", err.c_str());
+    // IncompleteInput here now means the socket really did end early, not that
+    // a buffer failed to grow -- there is no intermediate buffer any more.
+    Serial.printf("[fetch] JSON error: %s (declared %d B)\n", err.c_str(), bodyLen);
     stats.requestsFail++;
     return false;
   }
