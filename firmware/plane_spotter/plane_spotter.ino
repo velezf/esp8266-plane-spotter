@@ -473,7 +473,11 @@ inline const char* acRegFor(const char*)  { return ""; }
 // rough guess from altitude + ground speed. Real category data always wins.
 // Estimated types are flagged with '~' on screen.
 int categoryFrom(int cat, bool onGround, float velocityMs, float altitudeM) {
-  if (cat > 0)  return cat;                   // real data
+  // Categories 0 and 1 are both "no information" in the ADS-B emitter enum --
+  // 0 is the field absent, 1 is the transponder explicitly saying it has none.
+  // Only 2 and up name an actual airframe class, so 1 must fall through to the
+  // guess rather than being echoed back as though it were identity.
+  if (cat > 1)  return cat;                   // real data
   if (onGround) return 0;
   // A missing field is not a slow, low one. OpenSky leaves velocity and both
   // altitudes null often enough that defaulting them to zero made every such
@@ -1611,7 +1615,7 @@ int effectiveCategory(const Aircraft& a) {
 }
 bool isEstimatedType(const Aircraft& a) {
   if (acTypeFor(a.icao24)[0] != '\0') return false;   // resolved, not guessed
-  return a.category == 0 && !a.onGround;
+  return a.category <= 1 && !a.onGround;              // 0 and 1 both mean "no info"
 }
 
 // Best-available airframe class for the current target: resolved type code if
@@ -1804,6 +1808,8 @@ void screenRadar() {
       // Chirp as the beam crosses it -- the classic radar tick, but only for
       // rotorcraft, only inside BUZZER_RANGE_KM, and only while this screen is
       // up, which keeps it to a few ticks per screen cycle instead of a sonar.
+      // The crossing geometry, range gate and chirp queue are hardware-verified;
+      // only the rotor-only path itself still awaits a live helicopter.
       if (dist <= BUZZER_RANGE_KM && sweptPast(prevSweepDeg, sweepDeg, (float)brg))
         buzzerSweepBlip();
 #endif
