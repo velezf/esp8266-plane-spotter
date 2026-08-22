@@ -128,9 +128,30 @@ stay inside it. These are load-bearing; the comments at each site explain why:
   aircraft" rather than erroring.
 - **The OAuth token is refreshed *before* the data client is constructed**, so
   two 16 KB TLS buffers never coexist.
-- **Use `getString()`, not `getStream()`,** for OpenSky. The response is
-  `Transfer-Encoding: chunked`; streaming hands raw hex length markers to the
-  JSON parser and yields nothing.
+- **Force HTTP/1.0 on the OpenSky fetch and parse straight off the socket.**
+  `https.useHTTP10(true)` before `GET()`, then `deserializeJson(doc,
+  https.getStream(), Filter)` — no intermediate body buffer at all.
+
+  This replaces earlier advice to prefer `getString()` over `getStream()`. That
+  advice was right about the symptom (streaming a *chunked* body feeds raw hex
+  length markers to the parser) but the cure was worse: `getString()` was
+  silently truncating **~15% of polls**. Chunked means `_size` is -1, so
+  `getString()`'s own `reserve()` never runs, and the core allocates a fresh
+  `String` per chunk header via `readStringUntil('\n')` — all inside the ~5.4 KB
+  contiguous window left by the live 16 KB TLS buffer. One failed allocation and
+  bytes-written stops matching bytes-declared, `writeToStream()` returns
+  `HTTPC_ERROR_STREAM_WRITE` (-10), and `getString()` — which returns
+  `const String&` and has no error channel — hands back a body cut mid-token.
+  The only symptom was a downstream `IncompleteInput`.
+
+  HTTP/1.0 forbids chunked encoding, which removes the chunk headers, their
+  allocations, *and* the reason streaming was unsafe. Note OpenSky sends no
+  `Content-Length` even then (`getSize()` is -1; it closes to signal end) —
+  that is expected and streaming does not need it.
+
+  **Do not "restore" `getString()` here.** Pre-reserving the buffer was tried
+  and made it worse — the reservation consumed the contiguous space the chunked
+  decoder needed, pushing failures from ~15% to ~28%.
 - **JSON is parsed through a `DeserializationOption::Filter`** that keeps only
   the ~11 state-vector indices actually used. Widening the filter or raising
   `SEARCH_RADIUS_DEG` (0.2° ≈ a 44×35 km box) increases parse RAM and can reboot
