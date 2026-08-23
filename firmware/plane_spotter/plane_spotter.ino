@@ -185,6 +185,7 @@ struct Blip {
   float   speedMs;
   uint8_t cat;      // effective emitter category (8 = rotorcraft)
   bool    loiter;   // rotorcraft that has held station (see HeliTrack)
+  bool    mil;      // icao24 in a military block, or a military type code
 };
 const uint8_t MAX_BLIPS = 20;
 Blip     blips[MAX_BLIPS];
@@ -364,6 +365,65 @@ static const char HELI_TYPES[] PROGMEM =
 // Uncrewed types that show up on ADS-B. Short list; most UAVs do not squawk.
 static const char UAV_TYPES[] PROGMEM = " RQ4 MQ9 MQ1 Q4 SHDW UAV ";
 
+// Military ICAO type designators, used to *confirm* a military contact once a
+// type code has resolved. It cannot be the primary signal: the identity lookup
+// only resolves contacts inside the rotorcraft envelope, so a C-130 at 400 kt
+// is never looked up and would never match. Detection is by icao24 block below.
+static const char MIL_TYPES[] PROGMEM =
+  " C130 C30J C130J LC30 EC30 KC30 C5M C5 C17 C27J "
+  "KC35 K35R KC10 KC46 B52 B1 B2 "
+  "F15 F16 F18 F22 F35 A10 AV8B T38 T6 T45 "
+  "E3TF E3CF E6 E2 C2 P8 P3 U2 RC35 "
+  "V22 H60 H64 H47 UH1 H53 H72 ";
+
+// ICAO 24-bit address blocks allocated to military operators.
+//
+// This is the *primary* signal precisely because it is free: the address is in
+// every state vector already, so it costs one integer compare and works on the
+// fast, high traffic the identity lookup will never touch.
+//
+// Only the US block is listed. That is deliberate rather than lazy -- this
+// device sits under the Washington DC area, where Andrews traffic is the
+// realistic case, and a wrong range is worse than a missing one because it
+// paints civil aircraft as military. Other nations' blocks are published and
+// easy to add here, but none has been checked against real traffic from this
+// spot, so they stay out until there is a reason. Ranges are inclusive.
+struct HexRange { uint32_t lo, hi; };
+static const HexRange MIL_HEX[] PROGMEM = {
+  { 0xADF7C8, 0xAFFFFF },   // United States military
+};
+
+// Parse a 6-hex-digit icao24. Returns false on anything malformed, which is
+// treated as "not military" -- never guess upward on bad input.
+bool parseHex24(const char* hex, uint32_t& out) {
+  if (hex == nullptr) return false;
+  uint32_t v = 0;
+  uint8_t  n = 0;
+  for (; hex[n]; n++) {
+    char c = hex[n];
+    uint8_t d;
+    if      (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+    else return false;
+    v = (v << 4) | d;
+  }
+  if (n != 6) return false;
+  out = v;
+  return true;
+}
+
+bool isMilitaryHex(const char* hex) {
+  uint32_t v;
+  if (!parseHex24(hex, v)) return false;
+  for (uint8_t i = 0; i < sizeof(MIL_HEX) / sizeof(MIL_HEX[0]); i++) {
+    uint32_t lo = pgm_read_dword(&MIL_HEX[i].lo);
+    uint32_t hi = pgm_read_dword(&MIL_HEX[i].hi);
+    if (v >= lo && v <= hi) return true;
+  }
+  return false;
+}
+
 // Exact token match against a space-delimited PROGMEM list. Walks the list a
 // byte at a time rather than copying it to a buffer -- it is ~250 bytes and
 // would otherwise want a stack buffer sized to match, which silently breaks
@@ -383,6 +443,13 @@ bool typeInList(const char* pgmList, const char* icaoType) {
     }
   }
   return false;
+}
+
+// Military if the address block says so, or if a resolved type code does. The
+// address is the detector; the type code only ever adds to it, so a contact
+// outside the listed blocks can still be caught once identity resolves.
+bool isMilitary(const char* hex, const char* icaoType) {
+  return isMilitaryHex(hex) || typeInList(MIL_TYPES, icaoType);
 }
 
 #if AC_LOOKUP_ENABLE
@@ -644,6 +711,76 @@ bool trackRotorcraft(const char* icao, double lat, double lon) {
 
 // Drop helicopters we have not heard from in a while, so a departed aircraft
 // does not keep its slot (or come back still flagged as loitering).
+// Military contacts already announced, so the alert fires on arrival rather
+// than every poll for as long as one is overhead. Same shape as helis[] and for
+// the same reason: blips[] is rebuilt each fetch and cannot remember anything.
+// Four slots is plenty -- in 50 minutes of sampling this airspace produced
+// zero military contacts, so the expected occupancy is nought or one.
+struct MilTrack { char icao24[8]; uint32_t lastSeenMs; };
+MilTrack milSeen[MAX_MIL];
+uint8_t  milCount = 0;
+
+// Fold one military sighting in. Returns true only on the poll it first
+// appears, which is when the alert should sound.
+bool trackMilitary(const char* icao) {
+  if (icao == nullptr || icao[0] == '\0') return false;
+  uint32_t now = millis();
+
+  for (uint8_t i = 0; i < milCount; i++) {
+    if (strcmp(milSeen[i].icao24, icao) == 0) {
+      milSeen[i].lastSeenMs = now;
+      return false;                       // already announced
+    }
+  }
+
+  uint8_t slot;
+  if (milCount < MAX_MIL) {
+    slot = milCount++;
+  } else {                                // evict the stalest
+    slot = 0;
+    for (uint8_t i = 1; i < MAX_MIL; i++)
+      if ((int32_t)(milSeen[i].lastSeenMs - milSeen[slot].lastSeenMs) < 0) slot = i;
+  }
+  strncpy(milSeen[slot].icao24, icao, sizeof(milSeen[0].icao24) - 1);
+  milSeen[slot].icao24[sizeof(milSeen[0].icao24) - 1] = '\0';
+  milSeen[slot].lastSeenMs = now;
+  return true;
+}
+
+void expireMilitary() {
+  uint32_t now = millis();
+  uint8_t  w   = 0;
+  for (uint8_t i = 0; i < milCount; i++) {
+    if ((uint32_t)(now - milSeen[i].lastSeenMs) < MIL_EXPIRE_MS) {
+      if (w != i) milSeen[w] = milSeen[i];
+      w++;
+    } else {
+      Serial.printf("[mil] %s lost\n", milSeen[i].icao24);
+    }
+  }
+  milCount = w;
+}
+
+// Drop an airframe from the loiter table because identity has since proved it
+// is not a rotorcraft.
+//
+// This happens for real: an aircraft on approach is slow and low, which is all
+// categoryFrom() has to go on, so a Cessna at 115 km/h and 190 m gets guessed
+// as a helicopter and anchored here a poll before the type code arrives to say
+// C172. Without this the false entry sits in a MAX_HELI slot until
+// HELI_EXPIRE_MS -- five minutes of a four-slot table held by a light single,
+// which could crowd out an actual helicopter.
+void dropRotorcraft(const char* icao, const char* icaoType) {
+  if (icao == nullptr || icao[0] == '\0') return;
+  for (uint8_t i = 0; i < heliCount; i++) {
+    if (strcmp(helis[i].icao24, icao) != 0) continue;
+    Serial.printf("[heli] %s reclassified as %s, dropped\n",
+                  icao, icaoType[0] ? icaoType : "?");
+    helis[i] = helis[--heliCount];      // order does not matter here
+    return;
+  }
+}
+
 void expireRotorcraft() {
   uint32_t now = millis();
   uint8_t  w   = 0;
@@ -865,6 +1002,7 @@ bool fetchAircraft() {
   best.distanceKm = 1e9;
   uint16_t count     = 0;
   uint8_t  rotorSeen = 0;
+  uint8_t  milSeen4Poll = 0;
   blipCount = 0;
 
   for (JsonArray s : states) {
@@ -893,8 +1031,12 @@ bool fetchAircraft() {
     const char* hexId = s[0] | "";
     const char* known = acTypeFor(hexId);
     if (known[0]) {
-      if      (typeInList(HELI_TYPES, known)) cat = 8;
-      else if (cat == 8)                      cat = 3;   // guessed heli, isn't one
+      if (typeInList(HELI_TYPES, known)) {
+        cat = 8;
+      } else if (cat == 8) {
+        cat = 3;                          // guessed heli, identity says otherwise
+        dropRotorcraft(hexId, known);     // ...so retract the loiter anchor too
+      }
     } else if (!onGround &&
                isfinite(velMs) && velMs * 3.6f < AC_LOOKUP_ENVELOPE_KMH &&
                isfinite(altM)  && altM         < AC_LOOKUP_ENVELOPE_M &&
@@ -902,6 +1044,23 @@ bool fetchAircraft() {
       // Plausibly a rotorcraft and close enough to matter: worth an identity
       // lookup once this fetch is done and its TLS client has gone away.
       acEnqueue(hexId, (float)d);
+    }
+
+    // Military: free to evaluate, so every contact gets checked regardless of
+    // speed, altitude or range -- unlike identity, which is gated.
+    bool mil = isMilitary(hexId, known);
+
+    if (mil) {
+      milSeen4Poll++;
+      if (trackMilitary(hexId)) {
+        Serial.printf("[mil] new contact %s %s d=%.1fkm type=%s\n",
+                      hexId, (const char*)(s[1] | ""), d, known[0] ? known : "?");
+#if BUZZER_ENABLE
+        // Same range gate as every other voice: something 25 km away is not
+        // worth a noise, and quiet hours still apply via buzzerService().
+        if (d <= BUZZER_RANGE_KM && !buzzerQuietNow()) buzzerMilitary();
+#endif
+      }
     }
 
     bool loiter = false;
@@ -917,6 +1076,7 @@ bool fetchAircraft() {
       blips[blipCount].speedMs = onGround ? 0.0f : velMs;
       blips[blipCount].cat     = (uint8_t)cat;
       blips[blipCount].loiter  = loiter;
+      blips[blipCount].mil     = mil;
       blipCount++;
     }
 
@@ -957,6 +1117,8 @@ bool fetchAircraft() {
   }
 
   expireRotorcraft();
+  expireMilitary();
+
 
   stats.inView       = count;
   if (count > stats.maxInView) stats.maxInView = count;
@@ -1260,7 +1422,14 @@ void buzzerService() {
 // The three voices, deliberately distinguishable without looking at the screen.
 // All sit inside the 2-5 kHz band where these piezo elements are loudest;
 // below ~2 kHz they go noticeably quiet.
+// Four voices, deliberately separated on both axes the element can express --
+// pitch and rhythm -- because on a single piezo that is all there is to work
+// with. Read down the list: pitch falls as the pulses get longer and fewer.
+// Military is the odd one out at the top: fastest and highest, a trill rather
+// than a beat, so it does not read as "more of the rotorcraft alert".
+// All four stay inside the 2-5 kHz band these elements actually project.
 void buzzerSweepBlip()  { buzzerChirp(1, 4000,  25,  40); }  // crisp tick
+void buzzerMilitary()   { buzzerChirp(4, 4500,  40,  45); }  // fast high trill
 void buzzerAcquire()    { buzzerChirp(2, 3000,  60,  70); }  // two-tone
 void buzzerLoiter()     { buzzerChirp(3, 2200, 120, 100); }  // lowest, insistent
 
@@ -1269,6 +1438,7 @@ inline bool buzzerQuietNow() { return true; }
 inline void buzzerChirp(uint8_t, uint16_t, uint16_t, uint16_t) {}
 inline void buzzerService()  {}
 inline void buzzerSweepBlip(){}
+inline void buzzerMilitary() {}
 inline void buzzerAcquire()  {}
 inline void buzzerLoiter()   {}
 #endif
@@ -1782,6 +1952,13 @@ bool nearestIsRotor()  {
 }
 bool nearestLoitering() { return nearestIsRotor() && isLoitering(nearest.icao24); }
 
+// Military by address block, or by a resolved type code. The nearest contact is
+// always looked up, so the type-code half is genuinely available here even
+// though it is not for most blips.
+bool nearestIsMilitary() {
+  return nearest.valid && isMilitary(nearest.icao24, acTypeFor(nearest.icao24));
+}
+
 void screenNearest() {
   drawHeader("TARGET");
 
@@ -1833,13 +2010,31 @@ void screenNearest() {
     u8g2.drawBox(126, gB - 1 - fh, 1, fh);
   }
 
-  // Rotorcraft alert, inverted so it reads as a banner rather than another
-  // data row. Sits in the bottom-left, clear of the km/h readout at x=98.
-  // A loitering one is the interesting case, so it says so and blinks.
-  if (nearestIsRotor()) {
+  // Alert banner, inverted so it reads as a banner rather than another data
+  // row. Sits in the bottom-left, clear of the km/h readout at x=98.
+  //
+  // One banner, chosen by precedence, because there is only room for one.
+  // Military and rotorcraft combine rather than compete -- around here a
+  // military contact is quite likely to be a rotorcraft (PAT UH-60s and the
+  // like), and collapsing that to just "MILITARY" would throw away the more
+  // specific fact. Loiter still wins the wording, since a contact holding
+  // station is the interesting case, and it blinks to say so.
+  // Longest string is "MIL ROTOR LOIT" at 73 px, still clear of x=98.
+  {
+    bool rotor  = nearestIsRotor();
     bool loiter = nearestLoitering();
-    if (!loiter || ((millis() / 500) & 1)) {
-      const char* msg = loiter ? "ROTOR LOITER" : "ROTORCRAFT";
+    bool mil    = nearestIsMilitary();
+
+    const char* msg = nullptr;
+    if      (mil && loiter) msg = "MIL ROTOR LOIT";
+    else if (mil && rotor)  msg = "MIL ROTOR";
+    else if (mil)           msg = "MILITARY";
+    else if (loiter)        msg = "ROTOR LOITER";
+    else if (rotor)         msg = "ROTORCRAFT";
+
+    // Military blinks too: it is the rarer event of the two and should catch
+    // the eye even when the contact is not holding station.
+    if (msg && (!(loiter || mil) || ((millis() / 500) & 1))) {
       int w = strlen(msg) * 5 + 3;
       u8g2.drawBox(0, 56, w, 8);
       u8g2.setDrawColor(0);

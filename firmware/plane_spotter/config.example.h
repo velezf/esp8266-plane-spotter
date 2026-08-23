@@ -88,6 +88,25 @@
 #define LOITER_MIN_MS     120000   // 2 min (= 4 polls at the default 30 s)
 #define HELI_EXPIRE_MS    300000   // 5 min
 
+// ---- Military contacts ---------------------------------------------------
+// Detected from the icao24 address block (free -- it is in every state vector,
+// so it works on fast, high traffic the identity lookup never touches) and
+// confirmed by ICAO type code when one has resolved. See MIL_HEX in the sketch
+// for why only the US block is listed.
+//
+// MAX_MIL is how many military airframes are remembered so the alert fires on
+// arrival instead of every poll. Sized for a *formation*, not for the typical
+// case: routine occupancy here is zero or one, but military transports arrive
+// several at a time, and that is precisely when the alert matters. Overflow is
+// not graceful -- LRU eviction means an evicted airframe is seen again next
+// poll and re-announced, so the alert repeats every 30 s. Verified by forcing
+// it: with 6 contacts against 4 slots, five of them double-announced.
+// MIL_EXPIRE_MS mirrors HELI_EXPIRE_MS -- long enough that a brief ADS-B
+// coverage gap does not re-announce, short enough that one which actually left
+// will.
+#define MAX_MIL         8
+#define MIL_EXPIRE_MS   300000   // 5 min
+
 // ---- Piezo buzzer (rotorcraft alerts) ------------------------------------
 // Passive buzzer -- it has no oscillator of its own, so the firmware drives it
 // with tone(). 3-pin module: VCC->3V3, GND->GND, S/IO->PIN_BUZZER. Bare 2-pin
