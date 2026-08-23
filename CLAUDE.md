@@ -270,12 +270,37 @@ compile-time switches — check the combinations still build when touching this.
 ### Aircraft identity lookup
 
 OpenSky almost never populates the emitter category (`cat=0`), which is why
-`categoryFrom()` guesses airframe type from speed and altitude. `fetchAircraftInfo()`
-resolves the **nearest contact only** by icao24 through three tiers — hexdb.io,
-then adsbdb.com, then adsb.lol — giving a registration and an ICAO type code.
-A type code is hard identity, so `classifyAirframeFrom()` prefers it over the
-category and the kinematic guess becomes the fallback rather than the primary
-path. Measured coverage over 24 aircraft overhead: 17/24, 20/24, 24/24.
+`categoryFrom()` guesses airframe type from speed and altitude.
+`fetchAircraftInfo()` resolves an airframe by icao24 through three tiers —
+hexdb.io, then adsbdb.com, then adsb.lol — giving a registration and an ICAO
+type code. A type code is hard identity, so it wins over both the category and
+the kinematic guess, for **every** contact now: the fetch parse applies it to
+`cat` directly, which is what puts a cross on a helicopter transiting above the
+120 km/h guess threshold and takes a wrong one off a slow fixed-wing. Measured
+coverage over 24 aircraft overhead: 17/24, 20/24, 24/24.
+
+**Who gets looked up, and why it is gated.** The nearest contact always is,
+unconditionally and first — it drives TARGET / INTEL / WEAPONS. Beyond that,
+only contacts that could plausibly *be* rotorcraft and are close enough to
+matter: `AC_LOOKUP_ENVELOPE_KMH` / `_M` and `AC_LOOKUP_RANGE_KM`. Measured over
+36 minutes of this airspace, 168 distinct airframes/hr pass through, 29% fall
+inside the envelope, and only **3%** are also within 15 km. The range gate is
+what keeps this affordable; without it the rate approaches the whole-sky figure.
+Resolving a 700 km/h contact at FL350 buys nothing — it is already classified
+correctly.
+
+**The binding cost is time, not API quota.** Tier calls are synchronous HTTPS on
+the same thread as the 30 fps render loop, so each one freezes the sweep and the
+clock. Measured: **~1.2 s** for a tier-1 hit, **~3.5 s** when both databases miss
+and it falls through to tier 3 (`[acid]` logs the duration). `AC_LOOKUP_MAX_PER_POLL`
+bounds this — at 2, plus the unconditional nearest, worst case is ~10 s of frozen
+display per 30 s poll. Raising it trades smoothness for coverage. The real fix
+would be spreading lookups across the render loop rather than bursting them
+after the fetch.
+
+Candidates are queued during the parse and drained **after** `fetchAircraft()`
+returns — never during it, because each lookup builds its own TLS client and two
+16 KB RX buffers must not coexist.
 
 **Positions never come from anywhere but OpenSky.** That is the whole point of
 the split: tier 3 is a community-run service, and if it rate-limits or vanishes
@@ -283,10 +308,23 @@ the chain degrades to tier 2, then to the guess, and nothing on screen breaks.
 Keep it that way — moving the *feed* to a best-effort endpoint would mean a 429
 blanks the entire display. `AC_LOOKUP_TIER3` turns it off.
 
-Results are cached per airframe including negative ones, so an unknown icao24 is
-not re-queried every poll. Tier 3 is plain HTTP, so it skips the 16 KB TLS
-buffer; note it is a *live* query and only knows airborne aircraft — fine here,
-since the nearest contact is airborne by definition.
+Results live in an `AC_CACHE_N`-entry LRU table (`acCache[]`), negatives
+included, so an unknown icao24 is not re-queried every poll. This was a single
+record until the lookup widened, and that was costing real requests: on an
+approach path aircraft cycle through faster than the six screens do, so the same
+few tails were re-resolved every time they came back around. A cache hit is now
+free, which is what pays for looking beyond the nearest contact — sizing note in
+`config.h` is based on ~24 distinct airframes per 10 minutes here.
+
+Tier 3 is plain HTTP, so it skips the 16 KB TLS buffer; note it is a *live*
+query and only knows airborne aircraft. It can also return a registration with
+an **empty type code** — that is cached as resolved and not retried, so identity
+without classification is a real state to expect.
+
+The type tables (`HELI_TYPES`, `UAV_TYPES`, `typeInList()`) sit *above* the
+`#if AC_LOOKUP_ENABLE` guard on purpose: `classifyAirframeFrom()` needs them
+whether or not lookups are compiled in. They were inside it, which meant
+`AC_LOOKUP_ENABLE 0` did not build at all.
 
 ### Threat gating
 

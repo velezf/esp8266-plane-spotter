@@ -141,6 +141,45 @@
 // overhead: hexdb 17/24, +adsbdb 20/24, +adsb.lol 24/24.
 #define AC_LOOKUP_ENABLE  1
 
+// How many airframes to remember. Entries are ~32 B, so 32 slots is ~1 KB of
+// static RAM, and negatives are cached too. Measured here: ~24 distinct
+// airframes pass through the box every 10 minutes, so 32 slots holds roughly
+// a quarter-hour of sky -- enough that an aircraft on approach which drops out
+// and comes back is a cache hit rather than another HTTPS round trip. LRU
+// eviction, so overflow costs accuracy on the stalest entry, never a stall.
+#define AC_CACHE_N  32
+
+// Lookups per poll. This is a *time* budget, not an API one: the tier calls are
+// synchronous HTTPS on the same thread as the 30 fps render loop, so each one
+// stalls the sweep and the clock for its duration (logged in ms by [acid]).
+// The nearest contact is always resolved first and does not count against this.
+#define AC_LOOKUP_MAX_PER_POLL  2
+
+// Candidates waiting to be resolved. Only ever drained AC_LOOKUP_MAX_PER_POLL
+// at a time; a deeper queue just means a better choice of which to resolve,
+// since the nearest queued candidate is always taken first.
+#define AC_QUEUE_N  6
+
+// Which non-nearest contacts are worth resolving. The point of widening the
+// lookup is catching rotorcraft the kinematic guess misses -- categoryFrom()
+// only guesses helicopter below 120 km/h, so one transiting at 200 km/h reads
+// as fixed-wing and never gets a cross marker. Identity fixes that, but only
+// for contacts that could plausibly be rotorcraft in the first place: a 700
+// km/h contact at FL350 is already classified correctly and resolving it buys
+// nothing but latency and requests.
+//
+// Measured over 36 minutes of this airspace: 168 distinct airframes/hr total,
+// of which 49/hr (29%) fall inside this envelope, and only 5/hr (3%) are also
+// within AC_LOOKUP_RANGE_KM. So the range gate is what keeps this cheap --
+// without it the lookup rate roughly matches the whole-sky figure.
+#define AC_LOOKUP_ENVELOPE_KMH  250.0
+#define AC_LOOKUP_ENVELOPE_M    3000.0
+
+// Only resolve envelope candidates this close. Matched to BUZZER_RANGE_KM,
+// because a rotorcraft further out cannot trigger an alert anyway -- it will be
+// resolved on its own merits once it closes, or once it becomes nearest.
+#define AC_LOOKUP_RANGE_KM  15.0
+
 // Tier 3 is adsb.lol, a community-run service. It is only queried when both
 // databases miss (~17% of contacts), so it sees a handful of requests an hour.
 // If it ever rate-limits or goes away, set this to 0: the chain degrades to
