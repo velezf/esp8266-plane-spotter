@@ -245,11 +245,22 @@ discriminating on track swing rather than displacement.
 
 ### Buzzer
 
-A passive buzzer on `PIN_BUZZER` (D6/GPIO12) chirps for rotorcraft only. Three
-voices: a tick as the radar sweep crosses a contact, a two-tone on acquisition,
-a lower insistent triple on loiter latch. All gated on `BUZZER_RANGE_KM`, and
-suppressed during quiet hours — which fall *open* (audible) until NTP syncs, so
-a clock that never sets cannot silence it.
+A passive buzzer on `PIN_BUZZER` (D6/GPIO12). **Four** voices, for rotorcraft
+and military contacts:
+
+| Voice | Pattern | Fires on |
+|---|---|---|
+| `buzzerSweepBlip` | 1 × 4000 Hz, 25 ms | sweep crossing a rotorcraft |
+| `buzzerMilitary`  | 4 × 4500 Hz, 40 ms | military contact arriving |
+| `buzzerAcquire`   | 2 × 3000 Hz, 60 ms | rotorcraft acquisition |
+| `buzzerLoiter`    | 3 × 2200 Hz, 120 ms | loiter latch |
+
+They are separated on both axes a single piezo can express — pitch and rhythm.
+Read down the table: pitch falls as pulses get longer. Military sits at the top
+deliberately, fastest and highest, a trill rather than a beat, so it does not
+read as "more of the rotorcraft alert". All four are gated on `BUZZER_RANGE_KM`
+and suppressed during quiet hours — which fall *open* (audible) until NTP syncs,
+so a clock that never sets cannot silence it.
 
 **Polarity is the trap here.** The hardware is a 3-pin module driven by an
 S9012, which is a **PNP** transistor: it conducts on a LOW base, so the module
@@ -339,6 +350,38 @@ The type tables (`HELI_TYPES`, `UAV_TYPES`, `typeInList()`) sit *above* the
 `#if AC_LOOKUP_ENABLE` guard on purpose: `classifyAirframeFrom()` needs them
 whether or not lookups are compiled in. They were inside it, which meant
 `AC_LOOKUP_ENABLE 0` did not build at all.
+
+### Military contacts
+
+Detected from the **icao24 address block** (`MIL_HEX`), and confirmed by ICAO
+type code (`MIL_TYPES`) when one has resolved. The address has to be primary,
+and the reason is structural: identity lookups are gated to the rotorcraft
+envelope, so a C-130 at 400 kt is never resolved and a type-code-only detector
+would never see it. The address is in every state vector already, so the check
+is one integer compare and works on any contact at any speed or range.
+
+**Only the US block is listed**, deliberately. This device sits under the
+Washington DC area where Andrews traffic is the realistic case, and a wrong
+range is worse than a missing one because it paints civil aircraft as military.
+Other nations' allocations are published and easy to add, but none has been
+checked against traffic from here.
+
+`milSeen[]` (`MAX_MIL`) remembers announced airframes so the alert fires on
+arrival, not every poll — same shape as `helis[]`, and for the same reason:
+`blips[]` is rebuilt each fetch and cannot remember anything. **`MAX_MIL` is
+sized for a formation, not the typical case.** Routine occupancy here is zero;
+50 minutes of sampling produced no military contact at all. But transports
+arrive several at a time, and overflow is not graceful — LRU eviction means an
+evicted airframe is seen again next poll and re-announced, so the alert repeats
+every 30 s. Verified by forcing it: 6 contacts against 4 slots double-announced
+five of them. Hence 8.
+
+On screen, military and rotorcraft **combine rather than compete** —
+`MILITARY` / `MIL ROTOR` / `MIL ROTOR LOIT`. Around here a military contact is
+quite likely to *be* a rotorcraft (PAT UH-60s and similar), and collapsing that
+to just "MILITARY" would discard the more specific fact. There is only room for
+one banner, so precedence picks it; loiter still wins the wording. Military
+blinks even without loiter, being the rarer event.
 
 ### Threat gating
 
@@ -442,43 +485,49 @@ pins ArduinoJson ^7.0.4), so do not merge it into `main`.
 
 ## Unverified on hardware
 
-Almost everything is now verified on real hardware. Settled — do not
+Almost everything is verified on real hardware now. Settled — do not
 re-litigate these:
 
 - **Display.** 2.42" SSD1309 on I²C at 0x3C, landscape, NONAME0 init, no reset
   line. All six screens render; the 0.96" SSD1306 remains a one-line fallback.
 - **Buzzer polarity and element.** 3-pin PNP/S9012 module on D6/GPIO12;
-  `BUZZER_ACTIVE_LOW 1` is correct. All three voices (4000 / 3000 / 2200 Hz)
-  sounded through the real `buzzerChirp`/`buzzerService` path — not raw
-  `tone()` — and were audible in the finished enclosure against bar-level
-  ambient noise. The by-hand `BUZZER_IDLE_LEVEL` restore does prevent the
-  `noTone()` drone.
-- **The sweep-chirp trigger chain.** Verified by temporarily hoisting the chirp
-  out of its `isRotor()` branch so every contact fired it: `sweptPast()` crossing
-  geometry (`sweep` landed within a few degrees of `brg` on every tick), the
-  `BUZZER_RANGE_KM` gate, the screen gate, and the chirp queue.
-- **Identity lookups**, all three tiers, including tier 3.
+  `BUZZER_ACTIVE_LOW 1` is correct. All four voices sounded through the real
+  `buzzerChirp`/`buzzerService` path — not raw `tone()` — and were audible in
+  the finished enclosure against bar-level ambient noise. The by-hand
+  `BUZZER_IDLE_LEVEL` restore does prevent the `noTone()` drone.
+- **The sweep-chirp trigger chain.** `sweptPast()` crossing geometry (`sweep`
+  landed within a few degrees of `brg` on every tick), the `BUZZER_RANGE_KM`
+  gate, the screen gate, and the chirp queue.
+- **The whole rotorcraft/military display path.** Cross marker (and that it
+  skips the persistence fade), doubled TARGET dwell, the pulsing loiter ring,
+  and every banner including the combined `MIL ROTOR` and `MIL ROTOR LOIT`.
+- **Identity lookups**, all three tiers, and a type code correcting a wrong
+  kinematic guess in flight — watched live on a C172 on approach.
 
-**What is left is the rotorcraft integration, and only a real helicopter can
-close it:** the cross marker on the radar, the inverted TARGET banner, the
-doubled dwell, `buzzerAcquire()`/`buzzerLoiter()` *fired by an actual contact*,
-and the loiter state machine on hardware rather than in a host harness.
+**The one thing still unproven is the loiter latch *geometry*** in
+`trackRotorcraft()`: that a contact stayed inside `LOITER_RADIUS_KM` for
+`LOITER_MIN_MS`. It is host-tested, and everything downstream of it is now
+proven on hardware, but the decision itself needs a real helicopter holding
+station.
 
-Two reasons this has stayed open for weeks. The search box is ~44×35 km, so a
-contact has to be genuinely close — one seen on FlightRadar landing at Frederick
-was never in our data at all. And `categoryFrom()` only guesses rotorcraft below
-120 km/h, so a helicopter transiting at 200 km/h read as fixed-wing. The widened
-identity lookup addresses the second half of that, but it still needs one to
-turn up inside the box.
+**How the rest got closed, because it applies to whatever is unverified next:**
+forcing the state beats waiting for it. Rather than wait weeks for a helicopter,
+a throwaway build forced the nearest contact to read as a military rotorcraft
+and latched loiter after three polls. That exercised rendering, dwell, banners
+and voices in one sitting. Be precise about what such a test proves: it verified
+everything *downstream* of the latch, not the latch itself. Earlier the same
+trick — hoisting the sweep chirp out of its `isRotor()` branch — proved the
+trigger chain.
 
-Watch for `[heli] new contact` and `[heli] … loitering` on serial. Note that
-`rotor=N` counts and `[heli]` lines from before the *Missing data is NAN* fix
-cannot be trusted — misclassified jets were entering `helis[]` — so old
-sightings are not evidence either way.
+Watch for `[heli] new contact`, `[heli] … loitering` and `[mil] new contact` on
+serial. Note that `rotor=N` counts and `[heli]` lines from before the *Missing
+data is NAN* fix cannot be trusted — misclassified jets were entering `helis[]`
+— so old sightings are not evidence either way.
 
 **Working-tree state:** a temporary per-contact `[blip]` dump lives in
-`fetchAircraft()`, deliberately uncommitted, so that when a rotorcraft finally
-appears its icao24, speed, altitude, range and resolved `cat` are all on serial.
-It is the difference between "`rotor=0`, no idea why" and a diagnosis. Remove it
-once the rotorcraft paths are confirmed. The board is normally flashed from the
-working tree, so it runs one commit *ahead* of `main` by exactly those ten lines.
+`fetchAircraft()`, deliberately uncommitted, logging icao24, callsign, range,
+speed, altitude, resolved `cat` and the ROTOR/MIL flags. It is the difference
+between "`rotor=0`, no idea why" and a diagnosis, and it is how the C172
+correction above was spotted. Remove it once the loiter latch is confirmed. The
+board is normally flashed from the working tree, so it runs one commit *ahead*
+of `main` by exactly those ten lines.
