@@ -478,10 +478,23 @@ Two remotes, and they are not interchangeable:
 - `origin` → `https://github.com/DaniloCannas/esp8266-plane-spotter.git` — the
   upstream project this was forked from. Do not push here.
 
-Upstream **PR #1** (`velezf:fix/arduinojson-v7-pin`) is open and awaiting the
-owner's approval. The branch exists on `fork` only — deleting it there would
-auto-close the PR. Its content is already superseded on `main` (commit 162a116
-pins ArduinoJson ^7.0.4), so do not merge it into `main`.
+**Upstreaming is not planned.** This fork has accumulated several fixes that are
+general rather than local to this build — the null-kinematics rotorcraft
+misclassification, emitter category 1 read as identity, and the chunked-response
+truncation that was silently losing ~15% of polls. All three would benefit any
+user of the upstream project. They are staying here anyway: upstream PR #1 has
+sat unreviewed since 2026-06-30, so the maintainer is not currently maintaining
+it and preparing more PRs would be effort spent on a queue nobody reads.
+
+Do not propose upstreaming again unless the owner becomes active. If that
+changes, send the truncation fix first — it is the most valuable and the most
+self-contained, and the response tells you whether the rest is worth preparing.
+
+Upstream **PR #1** (`velezf:fix/arduinojson-v7-pin`) is still open, left that
+way deliberately rather than withdrawn. Its content is already superseded on
+`main` (commit 162a116 pins ArduinoJson ^7.0.4), so do not merge it into `main`.
+The branch exists on `fork` only and deleting it there auto-closes the PR — that
+no longer matters much, but do not delete it as a side effect of tidying.
 
 ## Unverified on hardware
 
@@ -524,10 +537,14 @@ serial. Note that `rotor=N` counts and `[heli]` lines from before the *Missing
 data is NAN* fix cannot be trusted — misclassified jets were entering `helis[]`
 — so old sightings are not evidence either way.
 
-**Working-tree state:** a temporary per-contact `[blip]` dump lives in
-`fetchAircraft()`, deliberately uncommitted, logging icao24, callsign, range,
-speed, altitude, resolved `cat` and the ROTOR/MIL flags. It is the difference
-between "`rotor=0`, no idea why" and a diagnosis, and it is how the C172
-correction above was spotted. Remove it once the loiter latch is confirmed. The
-board is normally flashed from the working tree, so it runs one commit *ahead*
-of `main` by exactly those ten lines.
+The per-contact `[blip]` dump that closed most of the list is now permanent,
+behind `LOG_BLIP_DUMP` in `config.h` (default **0**). It logs icao24, callsign,
+range, speed, altitude, resolved `cat` and the ROTOR/MIL flags — the difference
+between "`rotor=0`, no idea why" and a diagnosis; it is how the C172
+misclassification was spotted live. It defaults off for the same reason as
+`LOG_REQUEST_URL`: each line pairs a public aircraft identity with its distance
+from the device, and a few simultaneous (position, distance) pairs recover the
+device coordinates by trilateration — do not paste `[blip]` logs anywhere
+public. It spent two weeks as uncommitted "remove before committing" code; that
+guard failed once (a marker comment reached `main`), which is why it is a
+config switch now.

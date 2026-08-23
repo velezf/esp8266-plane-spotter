@@ -50,6 +50,16 @@
 // somewhere. Turn on only while debugging the request itself.
 #define LOG_REQUEST_URL  0
 
+// Per-contact "[blip]" log line on every fetch: icao24, callsign, range,
+// speed, altitude, and the resolved category with ROTOR/MIL flags. This is the
+// diagnostic for "the gate decided something I didn't expect" -- match the
+// lines against FlightRadar and you can see exactly what the classifier had to
+// work with. Off by default for the same reason as LOG_REQUEST_URL: each line
+// pairs a public aircraft identity with its distance from the device, and a
+// handful of simultaneous (position, distance) pairs recovers the device
+// coordinates by trilateration. Anyone you paste a log to can do that math.
+#define LOG_BLIP_DUMP  0
+
 // ---- OpenSky OAuth2 client (optional) ------------------------------------
 // Leave both empty for anonymous access (small ~400 calls/day budget). For a
 // much larger quota, create a free account at https://opensky-network.org/,

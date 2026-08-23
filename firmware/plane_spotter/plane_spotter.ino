@@ -951,42 +951,38 @@ bool fetchAircraft() {
   el[0] = el[1] = el[2] = el[5] = el[6] = true;
   el[7] = el[8] = el[9] = el[10] = el[11] = el[13] = el[17] = true;
 
-  // OpenSky replies with Transfer-Encoding: chunked. getStream() would hand the
-  // raw chunked bytes (hex length markers) to the parser and yield nothing, so
-  // we use getString(), which de-chunks the body before we parse it.
-  // TEMPORARY IncompleteInput DIAGNOSTIC -- remove before committing.
-  // Failures cluster at 987/988 bytes while successes range 846..1645, which
-  // points at a fixed boundary rather than network truncation. Capture the
-  // contiguous-block picture around getString(): ESP8266 String truncates
-  // silently when a realloc cannot find a contiguous block, and the 16 KB TLS
-  // RX buffer allocated just above is exactly what would fragment it.
   // Parse straight off the socket. Nothing buffers the whole body.
   //
   // The old getString() path was truncating ~15% of polls, silently, mid-token.
-  // Root cause is memory pressure inside the chunked decoder: this response is
-  // Transfer-Encoding: chunked, and the core's chunked loop allocates a fresh
-  // String for every chunk header via readStringUntil('\n') -- all while the
-  // 16 KB TLS RX buffer leaves just ~8 KB free and ~5.4 KB contiguous. When an
-  // allocation there fails, bytes-written stops matching bytes-declared and the
-  // loop bails with HTTPC_ERROR_STREAM_WRITE (-10), handing back a partial body.
-  // getString() returns `const String&` and has no error channel, so the only
-  // symptom downstream was a JSON IncompleteInput.
+  // Root cause is memory pressure inside the chunked decoder: the HTTP/1.1
+  // response was Transfer-Encoding: chunked, and the core's chunked loop
+  // allocates a fresh String for every chunk header via readStringUntil('\n')
+  // -- all while the 16 KB TLS RX buffer leaves just ~8 KB free and ~5.4 KB
+  // contiguous. When an allocation there fails, bytes-written stops matching
+  // bytes-declared and the loop bails with HTTPC_ERROR_STREAM_WRITE (-10),
+  // handing back a partial body. getString() returns `const String&` and has
+  // no error channel, so the only symptom downstream was a JSON IncompleteInput.
   //
   // useHTTP10(true) (set before GET, above) removes the whole failure mode
   // rather than working around it: HTTP/1.0 has no chunked encoding, so there
-  // are no chunk headers and no per-chunk allocations, and the reply carries a
-  // real Content-Length. That is also what makes streaming safe here -- the old
-  // comment warning that getStream() feeds raw hex length markers to the parser
-  // was true only *because* of chunking. With that gone, ArduinoJson reads the
-  // socket directly and the ~2 KB body String disappears from the heap.
+  // are no chunk headers and no per-chunk allocations. That is also what makes
+  // streaming safe here -- getStream() on the *chunked* response would have fed
+  // raw hex length markers to the parser. With chunking gone, ArduinoJson reads
+  // the socket directly and the ~2 KB body String disappears from the heap.
+  //
+  // Note OpenSky sends no Content-Length even on HTTP/1.0 -- getSize() stays
+  // -1 and the server closes the connection to signal end-of-body. Streaming
+  // does not need the length, so that is fine; do not "restore" getString()
+  // here, and see CLAUDE.md before touching any of this.
   JsonDocument doc;
   DeserializationError err = deserializeJson(
       doc, https.getStream(), DeserializationOption::Filter(filter));
   int bodyLen = https.getSize();
   https.end();
 
-  Serial.printf("[fetch] body=%d bytes (streamed) heap=%u\n",
-                bodyLen, ESP.getFreeHeap());
+  // bodyLen is always -1 (no Content-Length, see above), so don't log it as if
+  // it measured anything -- the parse either succeeded or errors just below.
+  Serial.printf("[fetch] streamed ok, heap=%u\n", ESP.getFreeHeap());
 
   if (err) {
     // IncompleteInput here now means the socket really did end early, not that
@@ -1049,6 +1045,20 @@ bool fetchAircraft() {
     // Military: free to evaluate, so every contact gets checked regardless of
     // speed, altitude or range -- unlike identity, which is gated.
     bool mil = isMilitary(hexId, known);
+
+#if LOG_BLIP_DUMP
+    // One line per contact so a rotorcraft or military contact seen on
+    // FlightRadar can be matched against what the gates actually decided --
+    // the difference between "rotor=0, no idea why" and a diagnosis. Off by
+    // default for the privacy reason documented in config.h: distance-from-home
+    // against public aircraft positions trilaterates the device location.
+    Serial.printf("[blip] %s %-8s d=%5.1fkm v=%6.1fkmh alt=%7.1fm cat=%2d%s%s\n",
+                  (const char*)(s[0] | "------"), (const char*)(s[1] | ""),
+                  d,
+                  isfinite(velMs) ? velMs * 3.6f : -1.0f,
+                  isfinite(altM)  ? altM         : -1.0f,
+                  cat, isRotor(cat) ? " <-- ROTOR" : "", mil ? " <-- MIL" : "");
+#endif
 
     if (mil) {
       milSeen4Poll++;
