@@ -75,10 +75,11 @@ needed; they are cheap to recreate and brittle against reordering.
 
 ## Architecture
 
-`firmware/plane_spotter/plane_spotter.ino` is the whole program (~1460 lines),
+`firmware/plane_spotter/plane_spotter.ino` is the whole program (~2300 lines),
 organized top-to-bottom as: display constructor → data structs → math helpers →
-rotorcraft tracking → network fetchers → buzzer → weapons/classification →
-drawing primitives → six `screenX()` functions → `render()` → `setup()`/`loop()`.
+type tables → identity cache/lookup → rotorcraft tracking → network fetchers →
+buzzer → weapons/classification → drawing primitives → six `screenX()`
+functions → `render()` → `setup()`/`loop()`.
 
 `loop()` is a cooperative scheduler on `millis()` deltas, no RTOS or timers. It
 runs at ~30 fps (`delay(33)`) so the radar sweep animates and the clock ticks,
@@ -117,7 +118,20 @@ forward from `lastDataMs` via `projectLatLon()` — blips visibly creep between
 fetches. Anything added to the radar needs the same treatment or it will look
 frozen next to the moving blips.
 
+Both are rebuilt from scratch every poll, which is why neither can carry
+identity. Two tables deliberately *do* survive across polls and are keyed by
+icao24: `helis[]` (loiter anchors) and `acCache[]` (resolved registrations and
+type codes). If you need something to persist between fetches, it belongs in one
+of those, not in `blips[]`.
+
 ### Memory constraints
+
+Current footprint: **47.2% static RAM, 45.4% flash** (`pio run` reports both).
+The number that actually bites is not static RAM but free heap *during a fetch*:
+the live 16 KB TLS RX buffer leaves only **~8 KB free and ~5.4 KB contiguous**,
+measured. Both memory bugs found so far lived in exactly that window, so treat
+any new allocation on the fetch path as suspect. Busiest sky observed is 16
+contacts against `MAX_BLIPS` 20 — the saturated case has never been tested.
 
 The ESP8266 has ~40 KB usable heap and several non-obvious rules exist purely to
 stay inside it. These are load-bearing; the comments at each site explain why:
@@ -428,23 +442,43 @@ pins ArduinoJson ^7.0.4), so do not merge it into `main`.
 
 ## Unverified on hardware
 
-**Buzzer hardware is now verified.** A 3-pin module is wired on D6/GPIO12 and a
-boot self-test sounded all three voices (4000 / 3000 / 2200 Hz) cleanly, then
-went silent. So the PNP/S9012 assumption holds — `BUZZER_ACTIVE_LOW 1` is
-correct, and the by-hand `BUZZER_IDLE_LEVEL` restore does prevent the `noTone()`
-drone. Do not re-litigate the polarity; it is settled on this hardware.
+Almost everything is now verified on real hardware. Settled — do not
+re-litigate these:
 
-What remains untested needs a helicopter within `BUZZER_RANGE_KM` and cannot be
-forced:
+- **Display.** 2.42" SSD1309 on I²C at 0x3C, landscape, NONAME0 init, no reset
+  line. All six screens render; the 0.96" SSD1306 remains a one-line fallback.
+- **Buzzer polarity and element.** 3-pin PNP/S9012 module on D6/GPIO12;
+  `BUZZER_ACTIVE_LOW 1` is correct. All three voices (4000 / 3000 / 2200 Hz)
+  sounded through the real `buzzerChirp`/`buzzerService` path — not raw
+  `tone()` — and were audible in the finished enclosure against bar-level
+  ambient noise. The by-hand `BUZZER_IDLE_LEVEL` restore does prevent the
+  `noTone()` drone.
+- **The sweep-chirp trigger chain.** Verified by temporarily hoisting the chirp
+  out of its `isRotor()` branch so every contact fired it: `sweptPast()` crossing
+  geometry (`sweep` landed within a few degrees of `brg` on every tick), the
+  `BUZZER_RANGE_KM` gate, the screen gate, and the chirp queue.
+- **Identity lookups**, all three tiers, including tier 3.
 
-- **Rotorcraft rendering** — cross marker, TARGET banner, doubled dwell. The
-  loiter state machine is host-tested, but nothing has been seen on the panel.
-- **The buzzer *trigger* paths** — sweep tick, two-tone acquisition, loiter
-  triple. The element is proven; what calls it is not.
+**What is left is the rotorcraft integration, and only a real helicopter can
+close it:** the cross marker on the radar, the inverted TARGET banner, the
+doubled dwell, `buzzerAcquire()`/`buzzerLoiter()` *fired by an actual contact*,
+and the loiter state machine on hardware rather than in a host harness.
 
-Watch for `[heli] new contact` and `[heli] … loitering` on serial. Note the
-rotorcraft misclassification bug (see *Missing data is NAN*) meant earlier
-`rotor=N` counts and `[heli]` lines could not be trusted — sightings before that
-fix do not count as evidence either way.
+Two reasons this has stayed open for weeks. The search box is ~44×35 km, so a
+contact has to be genuinely close — one seen on FlightRadar landing at Frederick
+was never in our data at all. And `categoryFrom()` only guesses rotorcraft below
+120 km/h, so a helicopter transiting at 200 km/h read as fixed-wing. The widened
+identity lookup addresses the second half of that, but it still needs one to
+turn up inside the box.
 
-The board is flashed from this branch, so it is currently *newer* than `main`.
+Watch for `[heli] new contact` and `[heli] … loitering` on serial. Note that
+`rotor=N` counts and `[heli]` lines from before the *Missing data is NAN* fix
+cannot be trusted — misclassified jets were entering `helis[]` — so old
+sightings are not evidence either way.
+
+**Working-tree state:** a temporary per-contact `[blip]` dump lives in
+`fetchAircraft()`, deliberately uncommitted, so that when a rotorcraft finally
+appears its icao24, speed, altitude, range and resolved `cat` are all on serial.
+It is the difference between "`rotor=0`, no idea why" and a diagnosis. Remove it
+once the rotorcraft paths are confirmed. The board is normally flashed from the
+working tree, so it runs one commit *ahead* of `main` by exactly those ten lines.
