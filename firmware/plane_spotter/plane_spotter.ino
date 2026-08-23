@@ -244,12 +244,29 @@ struct RouteInfo {
 // (icao24 set, haveInfo false), so an unknown airframe is not re-queried every
 // poll. See AC_LOOKUP_* in config.h.
 struct AircraftInfo {
-  char    icao24[8];    // which airframe this describes
-  char    reg[10];      // registration / tail number
-  char    icaoType[6];  // ICAO type designator, e.g. C172, R22, A321
-  bool    haveInfo;
-  uint8_t tier;         // which tier answered (0 = none), for the logs
-} acInfo;
+  char     icao24[8];    // which airframe this describes
+  char     reg[10];      // registration / tail number
+  char     icaoType[6];  // ICAO type designator, e.g. C172, R22, A321
+  bool     haveInfo;     // a tier answered; false is a cached *negative*
+  uint8_t  tier;         // which tier answered (0 = none), for the logs
+  bool     used;         // slot is occupied
+  uint32_t touchedMs;    // last hit, for LRU eviction
+};
+
+// Identity cache. This used to be a single record, which meant an airframe was
+// re-queried every time it came back around -- and on an approach path aircraft
+// cycle through faster than the six screens do, so the same handful of tails
+// were being looked up repeatedly. Caching them (negatives included, so an
+// unknown icao24 is not retried every poll) makes re-acquisition free and is
+// what pays for widening lookups beyond the nearest contact.
+AircraftInfo acCache[AC_CACHE_N];
+
+// Airframes waiting to be resolved, filled during the fetch parse and drained
+// afterwards -- never during it, because a lookup opens its own TLS client and
+// two 16 KB RX buffers must not coexist with the OpenSky one.
+struct AcPending { char icao24[8]; float distanceKm; };
+AcPending acQueue[AC_QUEUE_N];
+uint8_t   acQueueN = 0;
 
 // Runtime statistics (the nerdy bit)
 struct Stats {
@@ -333,8 +350,6 @@ const char* compass(double bearing) {
 // changes. Every tier is allowed to fail: the caller falls back to the
 // kinematic guess, so no lookup can break the display.
 // ---------------------------------------------------------------------------
-#if AC_LOOKUP_ENABLE
-
 // ICAO type designators that are rotorcraft. Space-delimited with leading and
 // trailing spaces so a padded " CODE " match cannot hit a substring (" B06 "
 // must not match "B06T"). Not exhaustive -- covers what actually flies over
@@ -370,6 +385,7 @@ bool typeInList(const char* pgmList, const char* icaoType) {
   return false;
 }
 
+#if AC_LOOKUP_ENABLE
 // Copy a small field out of a JSON doc into a fixed buffer, trimmed.
 void copyField(char* dst, size_t n, const char* src) {
   if (src == nullptr) { dst[0] = '\0'; return; }
@@ -380,7 +396,7 @@ void copyField(char* dst, size_t n, const char* src) {
 }
 
 // Tier 1: hexdb.io. Already used for routes, so no new dependency.
-bool acLookupHexdb(const char* hex) {
+bool acLookupHexdb(const char* hex, AircraftInfo& out) {
   String payload;
   if (!httpGetString(String("https://hexdb.io/api/v1/aircraft/") + hex, payload)) return false;
   JsonDocument d;
@@ -388,13 +404,13 @@ bool acLookupHexdb(const char* hex) {
   const char* reg = d["Registration"] | "";
   const char* typ = d["ICAOTypeCode"] | "";
   if (!reg[0] && !typ[0]) return false;
-  copyField(acInfo.reg, sizeof(acInfo.reg), reg);
-  copyField(acInfo.icaoType, sizeof(acInfo.icaoType), typ);
+  copyField(out.reg, sizeof(out.reg), reg);
+  copyField(out.icaoType, sizeof(out.icaoType), typ);
   return true;
 }
 
 // Tier 2: adsbdb.com. Independent database, better on US general aviation.
-bool acLookupAdsbdb(const char* hex) {
+bool acLookupAdsbdb(const char* hex, AircraftInfo& out) {
   String payload;
   if (!httpGetString(String("https://api.adsbdb.com/v0/aircraft/") + hex, payload)) return false;
   JsonDocument d;
@@ -404,8 +420,8 @@ bool acLookupAdsbdb(const char* hex) {
   const char* reg = a["registration"] | "";
   const char* typ = a["icao_type"] | "";
   if (!reg[0] && !typ[0]) return false;
-  copyField(acInfo.reg, sizeof(acInfo.reg), reg);
-  copyField(acInfo.icaoType, sizeof(acInfo.icaoType), typ);
+  copyField(out.reg, sizeof(out.reg), reg);
+  copyField(out.icaoType, sizeof(out.icaoType), typ);
   return true;
 }
 
@@ -414,7 +430,7 @@ bool acLookupAdsbdb(const char* hex) {
 // database -- it only knows aircraft currently airborne, which is exactly when
 // one is our nearest contact. Plain HTTP, so no TLS buffer. Only reached when
 // both databases miss.
-bool acLookupAdsbLol(const char* hex) {
+bool acLookupAdsbLol(const char* hex, AircraftInfo& out) {
   String payload;
   if (!httpGetStringPlain(String("http://api.adsb.lol/v2/hex/") + hex, payload)) return false;
   JsonDocument d;
@@ -425,45 +441,128 @@ bool acLookupAdsbLol(const char* hex) {
   const char* reg = a["r"] | "";
   const char* typ = a["t"] | "";
   if (!reg[0] && !typ[0]) return false;
-  copyField(acInfo.reg, sizeof(acInfo.reg), reg);
-  copyField(acInfo.icaoType, sizeof(acInfo.icaoType), typ);
+  copyField(out.reg, sizeof(out.reg), reg);
+  copyField(out.icaoType, sizeof(out.icaoType), typ);
   return true;
 }
 #endif
 
-void fetchAircraftInfo(const char* hex) {
-  copyField(acInfo.icao24, sizeof(acInfo.icao24), hex);
-  acInfo.reg[0] = acInfo.icaoType[0] = '\0';
-  acInfo.haveInfo = false;
-  acInfo.tier     = 0;
-  if (hex == nullptr || hex[0] == '\0') return;
+// Cache entry for `hex`, or nullptr if this airframe has never been resolved.
+// A hit here counts as known even when haveInfo is false -- that is a cached
+// negative and must suppress a retry just as firmly as a positive.
+AircraftInfo* acCacheFind(const char* hex) {
+  if (hex == nullptr || hex[0] == '\0') return nullptr;
+  for (uint8_t i = 0; i < AC_CACHE_N; i++) {
+    if (acCache[i].used && strcmp(acCache[i].icao24, hex) == 0) {
+      acCache[i].touchedMs = millis();
+      return &acCache[i];
+    }
+  }
+  return nullptr;
+}
 
-  if      (acLookupHexdb(hex))  { acInfo.haveInfo = true; acInfo.tier = 1; }
-  else if (acLookupAdsbdb(hex)) { acInfo.haveInfo = true; acInfo.tier = 2; }
+// A slot to write `hex` into: its existing entry, else a free slot, else the
+// least recently touched one.
+AircraftInfo* acCacheSlot(const char* hex) {
+  AircraftInfo* hit = acCacheFind(hex);
+  if (hit) return hit;
+
+  AircraftInfo* victim = &acCache[0];
+  for (uint8_t i = 0; i < AC_CACHE_N; i++) {
+    if (!acCache[i].used) { victim = &acCache[i]; break; }
+    if ((int32_t)(acCache[i].touchedMs - victim->touchedMs) < 0) victim = &acCache[i];
+  }
+  return victim;
+}
+
+bool acKnown(const char* hex) { return acCacheFind(hex) != nullptr; }
+
+void fetchAircraftInfo(const char* hex) {
+  if (hex == nullptr || hex[0] == '\0') return;
+  if (acCacheFind(hex)) return;                 // already resolved, or a negative
+
+  AircraftInfo* e = acCacheSlot(hex);
+  copyField(e->icao24, sizeof(e->icao24), hex);
+  e->reg[0] = e->icaoType[0] = '\0';
+  e->haveInfo = false;
+  e->tier     = 0;
+  e->used     = true;
+  e->touchedMs = millis();
+
+  uint32_t t0 = millis();
+  if      (acLookupHexdb(hex, *e))  { e->haveInfo = true; e->tier = 1; }
+  else if (acLookupAdsbdb(hex, *e)) { e->haveInfo = true; e->tier = 2; }
 #if AC_LOOKUP_TIER3
-  else if (acLookupAdsbLol(hex)){ acInfo.haveInfo = true; acInfo.tier = 3; }
+  else if (acLookupAdsbLol(hex, *e)){ e->haveInfo = true; e->tier = 3; }
 #endif
 
-  Serial.printf("[acid] %s -> %s %s (tier %u) heap=%u\n", hex,
-                acInfo.haveInfo ? acInfo.reg      : "?",
-                acInfo.haveInfo ? acInfo.icaoType : "?",
-                acInfo.tier, ESP.getFreeHeap());
+  // Duration matters as much as the result: these are synchronous HTTPS calls
+  // on the same thread as the 30 fps render loop, so it is what bounds how many
+  // can run per poll (AC_LOOKUP_MAX_PER_POLL).
+  Serial.printf("[acid] %s -> %s %s (tier %u) %lums heap=%u\n", hex,
+                e->haveInfo ? e->reg      : "?",
+                e->haveInfo ? e->icaoType : "?",
+                e->tier, (unsigned long)(millis() - t0), ESP.getFreeHeap());
 }
 
-// The resolved type code for `hex`, or "" when we have nothing cached for it.
+// Queue an airframe for resolution after the fetch finishes. Closest wins when
+// the queue is full, since a distant contact matters least and may well leave
+// the box before it is ever the nearest.
+void acEnqueue(const char* hex, float distanceKm) {
+  if (hex == nullptr || hex[0] == '\0' || acKnown(hex)) return;
+  for (uint8_t i = 0; i < acQueueN; i++)
+    if (strcmp(acQueue[i].icao24, hex) == 0) return;
+
+  if (acQueueN < AC_QUEUE_N) {
+    copyField(acQueue[acQueueN].icao24, sizeof(acQueue[0].icao24), hex);
+    acQueue[acQueueN].distanceKm = distanceKm;
+    acQueueN++;
+    return;
+  }
+  uint8_t worst = 0;
+  for (uint8_t i = 1; i < AC_QUEUE_N; i++)
+    if (acQueue[i].distanceKm > acQueue[worst].distanceKm) worst = i;
+  if (distanceKm < acQueue[worst].distanceKm) {
+    copyField(acQueue[worst].icao24, sizeof(acQueue[0].icao24), hex);
+    acQueue[worst].distanceKm = distanceKm;
+  }
+}
+
+// Resolve up to AC_LOOKUP_MAX_PER_POLL queued airframes, nearest first. Called
+// after fetchAircraft() has returned and its TLS client is gone.
+void acDrainQueue() {
+  uint8_t done = 0;
+  while (acQueueN > 0 && done < AC_LOOKUP_MAX_PER_POLL) {
+    uint8_t best = 0;
+    for (uint8_t i = 1; i < acQueueN; i++)
+      if (acQueue[i].distanceKm < acQueue[best].distanceKm) best = i;
+
+    char hex[8];
+    copyField(hex, sizeof(hex), acQueue[best].icao24);
+    acQueue[best] = acQueue[--acQueueN];        // compact
+    fetchAircraftInfo(hex);
+    done++;
+  }
+  acQueueN = 0;   // anything left is stale next poll anyway; it will re-queue
+}
+
+// The resolved type code for `hex`, or "" when we have nothing for it.
 const char* acTypeFor(const char* hex) {
-  if (!acInfo.haveInfo || hex == nullptr) return "";
-  return strcmp(acInfo.icao24, hex) == 0 ? acInfo.icaoType : "";
+  const AircraftInfo* e = acCacheFind(hex);
+  return (e && e->haveInfo) ? e->icaoType : "";
 }
 const char* acRegFor(const char* hex) {
-  if (!acInfo.haveInfo || hex == nullptr) return "";
-  return strcmp(acInfo.icao24, hex) == 0 ? acInfo.reg : "";
+  const AircraftInfo* e = acCacheFind(hex);
+  return (e && e->haveInfo) ? e->reg : "";
 }
 
 #else
 inline void fetchAircraftInfo(const char*) {}
-inline const char* acTypeFor(const char*) { return ""; }
-inline const char* acRegFor(const char*)  { return ""; }
+inline void acEnqueue(const char*, float)  {}
+inline void acDrainQueue()                 {}
+inline bool acKnown(const char*)           { return false; }
+inline const char* acTypeFor(const char*)  { return ""; }
+inline const char* acRegFor(const char*)   { return ""; }
 #endif
 
 // ---------------------------------------------------------------------------
@@ -786,6 +885,24 @@ bool fetchAircraft() {
     float altM     = s[13].isNull() ? (s[7].isNull() ? NAN : s[7].as<float>())
                                     : s[13].as<float>();
     int   cat      = categoryFrom(s[17] | 0, onGround, velMs, altM);
+
+    // A resolved ICAO type is hard identity and outranks the kinematic guess --
+    // for every contact now, not just the nearest. This is what puts a cross on
+    // a helicopter transiting above the 120 km/h guess threshold, and equally
+    // what takes a wrong cross *off* a slow fixed-wing on approach.
+    const char* hexId = s[0] | "";
+    const char* known = acTypeFor(hexId);
+    if (known[0]) {
+      if      (typeInList(HELI_TYPES, known)) cat = 8;
+      else if (cat == 8)                      cat = 3;   // guessed heli, isn't one
+    } else if (!onGround &&
+               isfinite(velMs) && velMs * 3.6f < AC_LOOKUP_ENVELOPE_KMH &&
+               isfinite(altM)  && altM         < AC_LOOKUP_ENVELOPE_M &&
+               d <= AC_LOOKUP_RANGE_KM) {
+      // Plausibly a rotorcraft and close enough to matter: worth an identity
+      // lookup once this fetch is done and its TLS client has gone away.
+      acEnqueue(hexId, (float)d);
+    }
 
     bool loiter = false;
     if (isRotor(cat)) {
@@ -2163,10 +2280,17 @@ void loop() {
     fetchAircraft();
     if (nearest.valid && strcmp(routeInfo.callsign, nearest.callsign) != 0)
       fetchRoute(nearest.callsign);
-    // Identity is keyed by airframe, not callsign, and is cached either way --
-    // a negative result still records the icao24 so it is not retried each poll.
-    if (nearest.valid && strcmp(acInfo.icao24, nearest.icao24) != 0)
-      fetchAircraftInfo(nearest.icao24);
+    // Identity is keyed by airframe, not callsign. The nearest contact is
+    // always resolved first and unconditionally -- it drives TARGET, INTEL and
+    // WEAPONS, so it must never lose out to a queued candidate. fetchAircraftInfo
+    // is a no-op on a cache hit, including a cached negative, so an aircraft
+    // that cycles back into nearest costs nothing.
+    if (nearest.valid) fetchAircraftInfo(nearest.icao24);
+
+    // Then any plausible-rotorcraft candidates queued during the parse, nearest
+    // first, bounded by AC_LOOKUP_MAX_PER_POLL. Deliberately after the fetch:
+    // each lookup builds its own TLS client and must not overlap OpenSky's.
+    acDrainQueue();
     lastPoll = now;
     firstFetchDone = true;
   }
