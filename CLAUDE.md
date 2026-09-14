@@ -112,21 +112,40 @@ bus-agnostic U8g2 API, so the SPI/I²C choice touches only the constructor.
 
 Two pieces of state decouple the fast render loop from the slow fetch loop:
 `nearest` (the single closest `Aircraft`, fully populated) and `blips[]` (up to
-`MAX_BLIPS` 20 lightweight lat/lon/track/speed records). Because fetches are 30 s
-apart but the radar redraws 30×/s, `screenRadar()` dead-reckons every blip
-forward from `lastDataMs` via `projectLatLon()` — blips visibly creep between
-fetches. Anything added to the radar needs the same treatment or it will look
-frozen next to the moving blips.
+`MAX_BLIPS` 20 lightweight records). Because fetches are 30 s apart but the
+radar redraws 30×/s, `screenRadar()` dead-reckons every blip forward from
+`lastDataMs` — blips visibly creep between fetches. Anything added to the radar
+needs the same treatment or it will look frozen next to the moving blips.
 
-Both are rebuilt from scratch every poll, which is why neither can carry
-identity. Two tables deliberately *do* survive across polls and are keyed by
+**Blips are stored flat, not as lat/lon.** Each holds east/north km from home
+and the velocity resolved onto the same axes (km/s), computed once at fetch
+time from the range and bearing already in hand. The per-frame update is then
+`x + vx*elapsed`, one `sqrt` for range and one `atan2` for bearing, and the
+pixel position is a scale of x/y with no trig at all. It used to re-run the
+great-circle projection, haversine and bearing per blip per frame — ~26
+software-double transcendental calls each, ~400 per frame in a 16-contact sky
+on an 80 MHz core with no FPU — which was most of the frame budget. Put new
+radar geometry in the same flat frame. And keep the trig **double**: the float
+variants (`sinf`, `atan2f`…) drag ~1 KB of libm argument-reduction tables into
+`.rodata`, which on the ESP8266 is DRAM. That was measured, not guessed.
+
+`nearestFlags` (rotor / loiter / military for the nearest contact) is the
+third piece: resolved once per poll by `refreshNearestFlags()` after the
+identity lookups, because each answer costs a cache scan plus a PROGMEM
+type-list walk and TARGET wanted all three every frame.
+
+`nearest` and `blips[]` are rebuilt from scratch every poll, which is why
+neither can carry identity. Two tables deliberately *do* survive across polls and are keyed by
 icao24: `helis[]` (loiter anchors) and `acCache[]` (resolved registrations and
 type codes). If you need something to persist between fetches, it belongs in one
 of those, not in `blips[]`.
 
 ### Memory constraints
 
-Current footprint: **47.2% static RAM, 45.4% flash** (`pio run` reports both).
+Current footprint: **47.8% static RAM, 45.7% flash** (`pio run` reports both).
+Note that on this chip `.rodata` counts against RAM, so string literals and
+libm tables cost DRAM — compare builds with `xtensa-lx106-elf-nm -S` on the ELF
+when a change grows RAM by more than its structs explain.
 The number that actually bites is not static RAM but free heap *during a fetch*:
 the live 16 KB TLS RX buffer leaves only **~8 KB free and ~5.4 KB contiguous**,
 measured. Both memory bugs found so far lived in exactly that window, so treat
@@ -262,6 +281,32 @@ read as "more of the rotorcraft alert". All four are gated on `BUZZER_RANGE_KM`
 and suppressed during quiet hours — which fall *open* (audible) until NTP syncs,
 so a clock that never sets cannot silence it.
 
+**The three arrival voices fire on the first *in-range* poll, not the first
+sighting.** `helis[]` and `milSeen[]` carry `acquireAlerted` / `loiterAlerted`
+/ `alerted` flags for exactly this. The distinction matters because the search
+box edge is always outside buzzer range: a 0.2° box is 17–22 km from home and
+the gate is 15 km, so anything that flies in is first seen out of range. The
+original code marked the airframe "announced" at first sighting and only
+range-checked that one poll, which meant the military and acquisition voices
+could not sound for any contact that did not pop into existence already close
+— a military rotorcraft was watched transit past with its banner up and no
+chime. The loiter flag resets on re-anchor so a second orbit alerts again.
+
+**Priority, not first-come.** `buzzerChirp()` takes a priority: the sweep
+tick is 0, the three alerts are 1. A higher priority cuts a lower one that is
+sounding; equal priority is first-come, so alerts never cut each other short
+and a tick still cannot stomp the tail of a loiter alert. This replaced a plain
+"in flight wins" rule under which a military trill arriving during a 25 ms
+tick was silently dropped. `loop()` also calls `buzzerPause()` before the fetch
+block, because nothing services the buzzer for the seconds the fetch and its
+lookups take and a tone that was on at that instant used to stay on for all of
+it. Alerts queued during the fetch play after the lookups, so the trill can
+land several seconds after `[mil] new contact`; that is latency, not loss.
+
+`prevSweepDeg` is re-seeded on the swap back to RADAR. Left stale for a
+minute it landed inside `sweptPast()`'s 30° window about one return in twelve
+and fired a stray tick for whatever sat in that arc.
+
 **Polarity is the trap here.** The hardware is a 3-pin module driven by an
 S9012, which is a **PNP** transistor: it conducts on a LOW base, so the module
 sounds when the pin is pulled low and must idle **HIGH**. Two consequences that
@@ -281,8 +326,7 @@ Voices sit at 4000 / 3000 / 2200 Hz. These elements have no oscillator and want
 **2–5 kHz** — below ~2 kHz they go noticeably quiet, so keep new tones in band.
 
 Everything is non-blocking. Never add `delay()` here — it would stutter the
-30 fps sweep. A pattern in flight is not preempted, so a sweep tick cannot stomp
-the tail of a loiter alert.
+30 fps sweep. Preemption is by priority, above.
 
 The pin choice is constrained, not arbitrary: GPIO16 (D0) is off the normal
 GPIO mux and cannot do `tone()`; GPIO0/GPIO2 must be HIGH at boot and a buzzer
@@ -332,6 +376,13 @@ the split: tier 3 is a community-run service, and if it rate-limits or vanishes
 the chain degrades to tier 2, then to the guess, and nothing on screen breaks.
 Keep it that way — moving the *feed* to a best-effort endpoint would mean a 429
 blanks the entire display. `AC_LOOKUP_TIER3` turns it off.
+
+**Routes are cached the same way**, in `routeCache[]` (`ROUTE_CACHE_N` 8,
+LRU, keyed by callsign, negatives included), and `fetchRoute()` only queries
+hexdb for callsigns that look like an airline flight — three letters then a
+digit. Before this, every swap of nearest cost two sequential TLS round trips
+with the display frozen, including for N-numbers that can never have a route,
+and those seconds were not counted in the lookup budget above.
 
 Results live in an `AC_CACHE_N`-entry LRU table (`acCache[]`), negatives
 included, so an unknown icao24 is not re-queried every poll. This was a single
@@ -452,7 +503,10 @@ than guessing when either input is not finite.
 Anything reading these fields must handle `NAN`. The display sites in
 `screenNearest()` show `alt --` / `--` km/h rather than printing `nan`; the
 dead-reckoning and track-lead paths already guarded correctly, since `NAN > 0` is
-false.
+false. True track (10) is `NAN` too now: as `0` it dead-reckoned the blip due
+north and pointed the TARGET arrow there. TARGET draws `--` in place of the
+arrow and INTEL shows `HDG ---`; a blip with unknown track or speed holds
+still, which is honest.
 
 Note the identity tiers do **not** rescue this. `classifyAirframeFrom()` prefers a
 resolved ICAO type code over the guess, but `fetchAircraftInfo()` only ever runs
@@ -522,6 +576,15 @@ re-litigate these:
 `LOITER_MIN_MS`. It is host-tested, and everything downstream of it is now
 proven on hardware, but the decision itself needs a real helicopter holding
 station.
+
+**Not yet flown (September 2026 alert/perf branch):** the in-range alert
+gating is host-tested (a contact first seen at 20 km alerts exactly once, on
+the first poll inside 15 km; loiter-and-entry on the same poll yields one
+loiter voice; re-anchor re-arms it) but has not sounded on hardware; nor have
+chirp priority preemption, `buzzerPause()`, the flat-coordinate radar, the
+route cache, or weather over HTTP/1.0 with a streamed parse. The weather change
+is the one to watch on the first boot: it mirrors the proven OpenSky path, but
+Open-Meteo has not been seen answering an HTTP/1.0 request from this device.
 
 **How the rest got closed, because it applies to whatever is unverified next:**
 forcing the state beats waiting for it. Rather than wait weeks for a helicopter,
