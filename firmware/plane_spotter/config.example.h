@@ -147,6 +147,12 @@
 // something well inside that is the interesting case.
 #define BUZZER_RANGE_KM  15.0
 
+// Inside this range a rotorcraft or military contact takes the TARGET / INTEL /
+// WEAPONS pages over closer civil traffic; beyond it, closest wins. Optional --
+// the sketch defaults it to 17 km, a little past the buzzer gate, if you leave
+// it out.
+// #define TARGET_PRIORITY_RANGE_KM  17.0
+
 // Radar-sweep blip: chirp as the sweep passes over a rotorcraft, but only
 // while the RADAR screen is actually showing. That works out to ~3 chirps per
 // screen cycle rather than a continuous sonar, which is what makes it

@@ -89,7 +89,7 @@ rotation is driven by a per-screen dwell table, `SCREEN_SWAP_MS[]`, not a
 uniform interval.
 
 Page order is `enum Screen`: RADAR opens with the situational picture, then
-TARGET / INTEL / WEAPONS are progressively deeper views of the *same* nearest
+TARGET / INTEL / WEAPONS are progressively deeper views of the *same* target
 contact, then the ambient pages (WX, SYSTEM). Add or reorder pages by editing
 the enum and the dwell table together — `render()` and the rotorcraft
 double-dwell in `loop()` both key off the names, so nothing else needs touching.
@@ -111,8 +111,24 @@ the `screen` index, and sends the whole buffer. All drawing goes through the
 bus-agnostic U8g2 API, so the SPI/I²C choice touches only the constructor.
 
 Two pieces of state decouple the fast render loop from the slow fetch loop:
-`nearest` (the single closest `Aircraft`, fully populated) and `blips[]` (up to
-`MAX_BLIPS` 20 lightweight records). Because fetches are 30 s apart but the
+`nearest` (the target `Aircraft`, fully populated) and `blips[]` (up to
+`MAX_BLIPS` 20 lightweight records).
+
+**`nearest` is the target, not the closest contact.** Selection in
+`fetchAircraft()` is by priority tier first — loitering rotorcraft, rotorcraft,
+military, everything else — and by range only within the tier. The name is
+historical. Plain closest-wins was handing TARGET / INTEL / WEAPONS to a 767 on
+approach while a Black Hawk sat 2 km further out, which defeats the point of
+the device; watched live on a PAT flight, which took TARGET at the military
+tier on its first poll and held it at the rotorcraft tier once its H60 type
+code came back. Two consequences: the tier uses `cat` as resolved *that* poll,
+so a fast rotorcraft outranks one poll after it is first queued for identity;
+and `targetBlip` carries the chosen blip's index so the radar rings the target
+rather than the nearest dot. `stats.closestEver` tracks true closest
+separately. The override applies inside `TARGET_PRIORITY_RANGE_KM` (17 km,
+sketch default, overridable from `config.h`); beyond it closest wins. It began
+uncapped and a departing Black Hawk held the pages from 25 km out over
+airliners passing overhead, which was judged too much. Because fetches are 30 s apart but the
 radar redraws 30×/s, `screenRadar()` dead-reckons every blip forward from
 `lastDataMs` — blips visibly creep between fetches. Anything added to the radar
 needs the same treatment or it will look frozen next to the moving blips.
@@ -436,7 +452,14 @@ blinks even without loiter, being the rarer event.
 
 ### Threat gating
 
-`classifyThreat()` scores aspect (how directly the contact tracks over the
+`classifyThreat()` is identity first, geometry second: a rotorcraft is
+**EXTREME** unconditionally and a military fixed-wing floors at **HIGH**; only
+civil fixed-wing traffic is scored by geometry (`classifyThreatGeometry()`).
+That is a product decision, not a modelling one — around here the rotorcraft
+is what the device exists for, and scoring one LOW because it was tracking
+away read as broken. EXTREME is drawn inverted on WEAPONS like the banners.
+
+The geometric half scores aspect (how directly the contact tracks over the
 device) against **slant** range, not ground distance — altitude is most of how
 far away an aircraft is, and on ground distance alone a jet at FL350 overhead
 scored the same as a Cessna at 2000 ft on the same track.
@@ -459,7 +482,9 @@ data. It classifies the nearest contact, picks a system from a PROGMEM table,
 and shows a track-lead angle plus notional envelope figures.
 
 Scope is deliberate and should stay that way: every contact is FRIENDLY,
-`AUTH:HOLD` is unconditional, and nothing is connected to anything. Envelope and
+firing authorization is unconditionally withheld (the `AUTH:HOLD` label was
+removed from the page as constant noise; the policy stands), and nothing is
+connected to anything. Envelope and
 time-of-flight use published reference figures; **PK is an invented geometric
 heuristic** labelled `NOTNL`, because no public data supports a real one. No
 no-escape-zone or doctrinal engagement data is represented, for the same reason.

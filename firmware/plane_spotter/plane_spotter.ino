@@ -41,6 +41,14 @@
 
 #include "config.h"
 
+// Range inside which a rotorcraft or military contact outranks closer civil
+// traffic for the TARGET / INTEL / WEAPONS pages. Beyond it, closest wins as
+// before. Overridable from config.h; the default is a little past
+// BUZZER_RANGE_KM so a contact still holds the pages as it crosses the gate.
+#ifndef TARGET_PRIORITY_RANGE_KM
+#define TARGET_PRIORITY_RANGE_KM  17.0
+#endif
+
 // ---------------------------------------------------------------------------
 // Display: SSD1306 128x64. Two builds selectable with DISPLAY_I2C:
 //   1 = I2C, 4-pin panel (default). GND / VCC / SCL / SDA only.
@@ -146,6 +154,10 @@ struct Aircraft {
   bool   valid;
 };
 
+// The *target*: the contact TARGET / INTEL / WEAPONS describe and the radar
+// circles. Named `nearest` for history, but since the priority change it is
+// the closest contact *within the highest priority tier present*, not the
+// closest full stop -- see the selection in fetchAircraft().
 Aircraft nearest;
 
 // Types for the WEAPONS SYSTEM page. Declared up here because the Arduino
@@ -153,7 +165,7 @@ Aircraft nearest;
 // a signature must already be a complete type by then.
 enum class AirframeClass : uint8_t { FIXED_WING, HELICOPTER, UAV, UNKNOWN };
 enum class AltitudeBand  : uint8_t { VERY_LOW, LOW_ALT, MEDIUM, MED_HIGH, HIGH_ALT, UNKNOWN };
-enum class ThreatLevel   : uint8_t { LOW_THREAT, MED_THREAT, HIGH_THREAT, UNKNOWN };
+enum class ThreatLevel   : uint8_t { LOW_THREAT, MED_THREAT, HIGH_THREAT, EXTREME_THREAT, UNKNOWN };
 enum class Envelope      : uint8_t { INSIDE, TOO_FAR, TOO_CLOSE, ALT_OUT, NO_DATA };
 
 // Approximate *published* reference figures. These are open-source
@@ -203,6 +215,7 @@ struct Blip {
 const uint8_t MAX_BLIPS = 20;
 Blip     blips[MAX_BLIPS];
 uint8_t  blipCount  = 0;
+int8_t   targetBlip = -1;  // index into blips[] of `nearest`, or -1 if it did not fit
 uint32_t lastDataMs = 0;   // millis() of the last successful aircraft fetch
 
 // Rotorcraft get special treatment, which means they need an identity that
@@ -691,6 +704,20 @@ int categoryFrom(int cat, bool onGround, float velocityMs, float altitudeM) {
 
 bool isRotor(int cat) { return cat == 8; }
 
+// Apply a resolved ICAO type code to a category. A type code is hard identity
+// and outranks both the emitter category and the kinematic guess: it puts a
+// cross on a helicopter transiting above the 120 km/h guess threshold and
+// takes a wrong one off a slow fixed-wing on approach. One rule for the blips
+// at fetch time and for the target on the pages -- the target used to get the
+// bare guess, so a Black Hawk at 205 km/h drew as "~Small" beside a banner
+// that correctly said MIL ROTOR.
+int identityCategory(int cat, const char* icaoType) {
+  if (icaoType == nullptr || icaoType[0] == '\0') return cat;
+  if (typeInList(HELI_TYPES, icaoType)) return 8;
+  if (typeInList(UAV_TYPES,  icaoType)) return 14;
+  return cat == 8 ? 3 : cat;      // guessed heli, identity says otherwise
+}
+
 // Fold one rotorcraft sighting into the tracking table. Returns true if this
 // airframe currently counts as loitering. Called once per rotorcraft per fetch.
 // `distanceKm` is the contact's range from home, already computed by the
@@ -1060,6 +1087,8 @@ bool fetchAircraft() {
   Aircraft best;
   best.valid      = false;
   best.distanceKm = 1e9;
+  uint8_t  bestPrio  = 0;
+  double   minD      = 1e9;   // true closest, for the SYSTEM statistic
   uint16_t count     = 0;
   uint8_t  rotorSeen = 0;
   uint8_t  milSeen4Poll = 0;
@@ -1072,6 +1101,7 @@ bool fetchAircraft() {
     double d   = haversineKm(HOME_LAT, HOME_LON, lat, lon);
     double brg = bearingDeg(HOME_LAT, HOME_LON, lat, lon);
     count++;
+    if (d < minD) minD = d;
 
     // Resolve the type here, while the full state vector is in hand: the radar
     // redraws far too often to re-derive it per frame.
@@ -1091,12 +1121,9 @@ bool fetchAircraft() {
     const char* hexId = s[0] | "";
     const char* known = acTypeFor(hexId);
     if (known[0]) {
-      if (typeInList(HELI_TYPES, known)) {
-        cat = 8;
-      } else if (cat == 8) {
-        cat = 3;                          // guessed heli, identity says otherwise
-        dropRotorcraft(hexId, known);     // ...so retract the loiter anchor too
-      }
+      int fixed = identityCategory(cat, known);
+      if (cat == 8 && fixed != 8) dropRotorcraft(hexId, known);   // retract the anchor too
+      cat = fixed;
     } else if (!onGround &&
                isfinite(velMs) && velMs * 3.6f < AC_LOOKUP_ENVELOPE_KMH &&
                isfinite(altM)  && altM         < AC_LOOKUP_ENVELOPE_M &&
@@ -1144,7 +1171,9 @@ bool fetchAircraft() {
       loiter = trackRotorcraft(hexId, lat, lon, d);
     }
 
+    int8_t thisBlip = -1;
     if (blipCount < MAX_BLIPS) {
+      thisBlip = (int8_t)blipCount;
       // Flat east/north km from the range and bearing already in hand, with
       // the velocity resolved onto the same axes so the radar dead-reckons with
       // one multiply per axis. Unknown speed or track means the blip holds
@@ -1165,7 +1194,21 @@ bool fetchAircraft() {
       b.mil    = mil;
     }
 
-    if (d < best.distanceKm) {
+    // Target selection: priority tier first, then range within the tier. A
+    // rotorcraft anywhere in the box outranks a closer airliner -- the special
+    // contacts are the point of the device, and plain "closest" was handing
+    // TARGET / INTEL / WEAPONS to a 767 on approach while a Black Hawk sat
+    // 2 km further out with its banner never shown. Loitering rotorcraft >
+    // rotorcraft > military > everything else -- inside
+    // TARGET_PRIORITY_RANGE_KM. Without the cap a departing Black Hawk held
+    // the pages from 25 km out over airliners passing overhead. Note the tier
+    // uses `cat` as resolved *this* poll, so a fast rotorcraft only outranks
+    // once its type code has come back (one poll after it is first queued).
+    uint8_t prio = isRotor(cat) ? (loiter ? 3 : 2) : (mil ? 1 : 0);
+    if (d > TARGET_PRIORITY_RANGE_KM) prio = 0;
+    if (prio > bestPrio || (prio == bestPrio && d < best.distanceKm)) {
+      bestPrio        = prio;
+      targetBlip      = thisBlip;
       best.distanceKm = d;
       best.lat        = lat;
       best.lon        = lon;
@@ -1208,12 +1251,12 @@ bool fetchAircraft() {
   lastDataMs         = millis();
 
   nearest = best;
-  if (nearest.valid && nearest.distanceKm < stats.closestEver)
-    stats.closestEver = nearest.distanceKm;
+  if (!nearest.valid) targetBlip = -1;
+  if (count > 0 && minD < stats.closestEver) stats.closestEver = minD;
 
-  Serial.printf("[fetch] inView=%u blips=%u rotor=%u nearest=%s cat=%d dist=%.1fkm valid=%d heap=%u\n",
+  Serial.printf("[fetch] inView=%u blips=%u rotor=%u target=%s prio=%u cat=%d dist=%.1fkm valid=%d heap=%u\n",
                 count, blipCount, rotorSeen, nearest.valid ? nearest.callsign : "-",
-                nearest.valid ? nearest.category : -1,
+                bestPrio, nearest.valid ? nearest.category : -1,
                 nearest.valid ? nearest.distanceKm : 0.0, nearest.valid,
                 ESP.getFreeHeap());
   return true;
@@ -1765,14 +1808,29 @@ AirframeClass classifyAirframe(int category) {
   }
 }
 
-// "Threat" here means aspect: how directly the contact is tracking over the
-// device, tightened by range. Everything is friendly regardless -- this drives
-// nothing but the label.
+// "Threat" is identity first, geometry second. A rotorcraft is EXTREME
+// wherever it is and whatever it is doing -- around here that is the contact
+// the whole device exists for, and scoring it LOW because it happened to be
+// tracking away was absurd. A military fixed-wing floors at HIGH. Everything
+// else is aspect (how directly the contact is tracking over the device)
+// tightened by slant range. Everything is friendly regardless -- this drives
+// nothing but the label and the notional PK.
 ThreatLevel classifyThreat(double bearingFromDevice, float trackDeg,
                            double distanceKm, float altitudeFt, bool haveAlt,
-                           bool valid) {
-  if (!valid || !isfinite(trackDeg) || !isfinite(distanceKm))
-    return ThreatLevel::UNKNOWN;
+                           bool valid, AirframeClass airframe, bool military) {
+  if (!valid) return ThreatLevel::UNKNOWN;
+  if (airframe == AirframeClass::HELICOPTER) return ThreatLevel::EXTREME_THREAT;
+
+  ThreatLevel geo = classifyThreatGeometry(bearingFromDevice, trackDeg,
+                                           distanceKm, altitudeFt, haveAlt);
+  if (military && geo != ThreatLevel::HIGH_THREAT) return ThreatLevel::HIGH_THREAT;
+  return geo;
+}
+
+// The geometric half, on its own so the floors above stay readable.
+ThreatLevel classifyThreatGeometry(double bearingFromDevice, float trackDeg,
+                                   double distanceKm, float altitudeFt, bool haveAlt) {
+  if (!isfinite(trackDeg) || !isfinite(distanceKm)) return ThreatLevel::UNKNOWN;
 
   // Bearing the contact would fly to pass over the device.
   double inbound = fmod(bearingFromDevice + 180.0, 360.0);
@@ -1868,8 +1926,9 @@ bool calcPk(const WeaponSystemRecord& w, double distanceKm, float altitudeFt,
     if (ceilFt > 0.0f) altFit = 1.0f - 0.5f * (altitudeFt / ceilFt);
   }
 
-  float aspectFit = (threat == ThreatLevel::HIGH_THREAT)   ? 1.0f
-                  : (threat == ThreatLevel::MED_THREAT) ? 0.85f : 0.7f;
+  float aspectFit = (threat == ThreatLevel::EXTREME_THREAT ||
+                     threat == ThreatLevel::HIGH_THREAT)   ? 1.0f
+                  : (threat == ThreatLevel::MED_THREAT)   ? 0.85f : 0.7f;
 
   float pk = rangeFit * altFit * aspectFit;
   if (pk < 0.05f) pk = 0.05f;
@@ -1901,10 +1960,11 @@ const char* altBandText(AltitudeBand b) {
 
 const char* threatText(ThreatLevel t) {
   switch (t) {
-    case ThreatLevel::LOW_THREAT:    return "LOW";
-    case ThreatLevel::MED_THREAT: return "MEDIUM";
-    case ThreatLevel::HIGH_THREAT:   return "HIGH";
-    default:                  return "UNKNOWN";
+    case ThreatLevel::LOW_THREAT:     return "LOW";
+    case ThreatLevel::MED_THREAT:     return "MEDIUM";
+    case ThreatLevel::HIGH_THREAT:    return "HIGH";
+    case ThreatLevel::EXTREME_THREAT: return "EXTREME";
+    default:                          return "UNKNOWN";
   }
 }
 
@@ -2029,14 +2089,31 @@ const char* typeName(int cat) {
   }
 }
 
+// Skull and crossbones, 16x14, for a military target. Takes the icon slot on
+// RADAR and TARGET in place of the airframe glyph; the type label and banner
+// still say what kind of airframe it is. XBM, LSB = leftmost pixel.
+static const unsigned char SKULL_XBM[] PROGMEM = {
+  0xe0, 0x07, 0xf0, 0x0f, 0xf8, 0x1f, 0x98, 0x19, 0x98, 0x19, 0xf8, 0x1f, 0x70, 0x0e, 0xe0, 0x07, 0xa0, 0x05, 0x03, 0xc0, 0x0c, 0x30, 0xf0, 0x0f, 0x0c, 0x30, 0x03, 0xc0
+};
+
+// Icon for the target: skull if military, otherwise the airframe glyph.
+void drawTargetIcon(int cx, int cy) {
+  if (nearestIsMilitary()) u8g2.drawXBMP(cx - 8, cy - 7, 16, 14, SKULL_XBM);
+  else                     drawTypeIcon(cx, cy, nearestCategory());
+}
+
 // Icon (~16x12) for an aircraft type, centred at (cx,cy).
 void drawTypeIcon(int cx, int cy, int cat) {
   switch (cat) {
-    case 8:  // helicopter
-      u8g2.drawDisc(cx - 1, cy, 2);
-      u8g2.drawHLine(cx - 7, cy - 3, 15);          // main rotor
-      u8g2.drawLine(cx + 1, cy, cx + 7, cy + 1);   // tail boom
-      u8g2.drawVLine(cx + 7, cy - 2, 5);           // tail rotor
+    case 8:  // helicopter -- a solid silhouette, not a stick figure
+      u8g2.drawHLine(cx - 8, cy - 5, 17);          // main rotor
+      u8g2.drawVLine(cx - 2, cy - 4, 2);           // mast
+      u8g2.drawRBox(cx - 7, cy - 2, 9, 5, 1);      // cabin
+      u8g2.drawBox(cx + 2, cy - 1, 6, 2);          // tail boom
+      u8g2.drawVLine(cx + 8, cy - 4, 6);           // tail rotor
+      u8g2.drawHLine(cx - 7, cy + 4, 9);           // skid
+      u8g2.drawPixel(cx - 5, cy + 3);              // skid struts
+      u8g2.drawPixel(cx - 1, cy + 3);
       break;
     case 9:  // glider (long slim wings)
       u8g2.drawHLine(cx - 8, cy, 17);
@@ -2089,7 +2166,8 @@ void drawSignalBars(int x, int y, int rssi) {
 }
 
 int effectiveCategory(const Aircraft& a) {
-  return categoryFrom(a.category, a.onGround, a.velocityMs, a.altitudeM);
+  return identityCategory(categoryFrom(a.category, a.onGround, a.velocityMs, a.altitudeM),
+                          acTypeFor(a.icao24));
 }
 bool isEstimatedType(const Aircraft& a) {
   if (acTypeFor(a.icao24)[0] != '\0') return false;   // resolved, not guessed
@@ -2108,10 +2186,14 @@ AirframeClass nearestAirframe() {
 // list, and TARGET wanted all three every frame while loop() wanted one for
 // the dwell. None of the inputs change between polls, so loop() computes them
 // once, after the fetch and its identity lookups have both run.
-struct NearestFlags { bool rotor, loiter, mil; };
+struct NearestFlags { bool rotor, loiter, mil; int cat; char type[6]; };
 NearestFlags nearestFlags;
 
 void refreshNearestFlags() {
+  nearestFlags.cat    = nearest.valid ? effectiveCategory(nearest) : 0;
+  strncpy(nearestFlags.type, nearest.valid ? acTypeFor(nearest.icao24) : "",
+          sizeof(nearestFlags.type) - 1);
+  nearestFlags.type[sizeof(nearestFlags.type) - 1] = '\0';
   nearestFlags.rotor  = nearest.valid && nearestAirframe() == AirframeClass::HELICOPTER;
   nearestFlags.loiter = nearestFlags.rotor && isLoitering(nearest.icao24);
   // Military by address block, or by a resolved type code. The nearest contact
@@ -2119,6 +2201,8 @@ void refreshNearestFlags() {
   // even though it is not for most blips.
   nearestFlags.mil    = nearest.valid && isMilitary(nearest.icao24, acTypeFor(nearest.icao24));
 }
+int  nearestCategory()   { return nearestFlags.cat;    }   // identity applied
+const char* nearestType(){ return nearestFlags.type;   }   // "" if unresolved
 bool nearestIsRotor()    { return nearestFlags.rotor;  }
 bool nearestLoitering()  { return nearestFlags.loiter; }
 bool nearestIsMilitary() { return nearestFlags.mil;    }
@@ -2137,7 +2221,7 @@ void screenNearest() {
   u8g2.drawStr(0, 24, nearest.callsign);
 
   // aircraft-type icon, between the callsign and the heading arrow
-  drawTypeIcon(82, 16, effectiveCategory(nearest));
+  drawTargetIcon(82, 16);
 
   u8g2.setFont(u8g2_font_6x12_tr);
   char line[24];
@@ -2293,8 +2377,8 @@ void screenRadar() {
 
   // blips, dead-reckoned + persistence. All float and flat -- see struct Blip.
   const float PX_PER_KM = (float)R / MAX_KM;
-  int   nearBx = 0, nearBy = 0;
-  float nearD  = 1e9f;
+  int  tBx = 0, tBy = 0;
+  bool haveTarget = false;
   for (uint8_t i = 0; i < blipCount; i++) {
     float x    = blips[i].x + blips[i].vx * elapsed;
     float y    = blips[i].y + blips[i].vy * elapsed;
@@ -2302,7 +2386,7 @@ void screenRadar() {
     if (dist > MAX_KM) continue;
     int bx = cx + (int)lroundf(x * PX_PER_KM);
     int by = cy - (int)lroundf(y * PX_PER_KM);
-    if (dist < nearD) { nearD = dist; nearBx = bx; nearBy = by; }
+    if ((int8_t)i == targetBlip) { tBx = bx; tBy = by; haveTarget = true; }
     float brg = (float)rad2deg(atan2(x, y));
     if (brg < 0.0f) brg += 360.0f;
 
@@ -2332,10 +2416,11 @@ void screenRadar() {
 
   prevSweepDeg = sweepDeg;
 
-  // highlight the closest live contact
-  if (nearD <= MAX_KM) {
-    u8g2.drawCircle(nearBx, nearBy, 3);
-    u8g2.drawDisc(nearBx, nearBy, 1);
+  // ring the target -- the same contact the side panel and TARGET describe,
+  // which since the priority change is not necessarily the closest dot
+  if (haveTarget) {
+    u8g2.drawCircle(tBx, tBy, 3);
+    u8g2.drawDisc(tBx, tBy, 1);
   }
 
   // side info panel
@@ -2346,13 +2431,28 @@ void screenRadar() {
     return;
   }
 
-  int ec = effectiveCategory(nearest);
-  drawTypeIcon(px + 7, 19, ec);
+  int ec = nearestCategory();
+  drawTargetIcon(px + 7, 18);
   u8g2.setFont(u8g2_font_5x7_tr);
-  char tname[12];
-  snprintf(tname, sizeof(tname), "%s%s", isEstimatedType(nearest) ? "~" : "", typeName(ec));
+  // A resolved type code is the most specific thing we know, so show it
+  // ("H60 HELI") rather than the class name it implies; unresolved contacts
+  // keep the guessed class with its '~'.
+  char tname[14];
+  const char* typ = nearestType();
+  if (typ[0]) snprintf(tname, sizeof(tname), "%s%s", typ, isRotor(ec) ? " HELI" : "");
+  else        snprintf(tname, sizeof(tname), "%s%s", isEstimatedType(nearest) ? "~" : "", typeName(ec));
   u8g2.drawStr(px + 18, 20, tname);
-  u8g2.drawStr(px, 32, nearest.callsign);
+  // Military callsign is drawn inverted, the same treatment as the TARGET
+  // banner, so the flag is visible on the page that is up most of the time.
+  if (nearestIsMilitary()) {
+    int w = strlen(nearest.callsign) * 5 + 3;
+    u8g2.drawBox(px - 1, 25, w, 9);
+    u8g2.setDrawColor(0);
+    u8g2.drawStr(px + 1, 32, nearest.callsign);
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawStr(px, 32, nearest.callsign);
+  }
 
   char l[20];
   snprintf(l, sizeof(l), "RNG %.0fkm", nearest.distanceKm);
@@ -2461,7 +2561,7 @@ void screenWeapons() {
   bool fresh = nearest.valid && lastDataMs != 0 &&
                (uint32_t)(millis() - lastDataMs) < TRACK_STALE_MS;
 
-  int   cat     = fresh ? effectiveCategory(nearest) : 0;
+  int   cat     = fresh ? nearestCategory() : 0;
   AirframeClass af = fresh ? classifyAirframeFrom(cat, acTypeFor(nearest.icao24))
                            : AirframeClass::UNKNOWN;
 
@@ -2470,7 +2570,8 @@ void screenWeapons() {
   AltitudeBand band = classifyAltitude(altFt, haveAlt);
 
   ThreatLevel threat = classifyThreat(nearest.bearingDeg, nearest.trackDeg,
-                                      nearest.distanceKm, altFt, haveAlt, fresh);
+                                      nearest.distanceKm, altFt, haveAlt, fresh,
+                                      af, fresh && nearestIsMilitary());
 
   uint8_t wsIdx = selectWeaponSystem(af, band, fresh ? nearest.distanceKm : 0.0);
   WeaponSystemRecord w;
@@ -2504,11 +2605,19 @@ void screenWeapons() {
   snprintf(line, sizeof(line), "ALT BAND: %s", altBandText(band));
   u8g2.drawStr(0, 21, line);
 
-  // Threat left, firing authorization right. Authorization is unconditionally
-  // denied: every contact here is friendly and nothing is armed.
+  // Firing authorization used to sit on this row as AUTH:HOLD. It is
+  // unconditional -- every contact is friendly and nothing is armed -- so it
+  // said the same thing on every frame and was dropped as noise. The policy
+  // has not changed, only the label.
   snprintf(line, sizeof(line), "THREAT: %s", threatText(threat));
-  u8g2.drawStr(0, 27, line);
-  u8g2.drawStr(128 - u8g2.getStrWidth("AUTH:HOLD"), 27, "AUTH:HOLD");
+  if (threat == ThreatLevel::EXTREME_THREAT) {      // inverted, like the banners
+    u8g2.drawBox(0, 21, strlen(line) * 4 + 3, 8);
+    u8g2.setDrawColor(0);
+    u8g2.drawStr(2, 27, line);
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawStr(0, 27, line);
+  }
 
   snprintf(line, sizeof(line), "SOLUTION: %s", sol);
   u8g2.drawStr(0, 33, line);
