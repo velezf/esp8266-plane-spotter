@@ -178,11 +178,24 @@ struct WeaponSystemRecord {
 // the position between data refreshes so the blips creep in real time. `cat`
 // and `loiter` are resolved at fetch time so the radar can mark rotorcraft
 // without re-deriving the type 30x a second.
+//
+// Positions are flat east/north offsets from home in km, with the velocity
+// already resolved onto the same axes (km/s). The radar redraws 30x a second
+// and used to re-run the great-circle projection, haversine and bearing for
+// every blip every frame -- roughly 26 software-double transcendental calls
+// each, which on an 80 MHz core with no FPU was most of the frame budget in a
+// busy sky. In this form a frame costs one sqrt and one atan2 per blip, and
+// the pixel position is a scale of x/y with no trig at all. The flat-earth
+// error over the 30 km ring is well under a pixel.
+//
+// The trig that remains is the double sin/cos/atan2 already linked for the
+// geo helpers, on purpose: the float variants drag ~1 KB of libm
+// argument-reduction tables into DRAM (two_over_pi and friends), which on this
+// chip is real RAM, for a per-call saving that does not matter at one call
+// per blip per frame.
 struct Blip {
-  double  lat;
-  double  lon;
-  float   track;
-  float   speedMs;
+  float   x, y;     // km east / north of home at lastDataMs
+  float   vx, vy;   // km/s east / north (0 when speed or track is unknown)
   uint8_t cat;      // effective emitter category (8 = rotorcraft)
   bool    loiter;   // rotorcraft that has held station (see HeliTrack)
   bool    mil;      // icao24 in a military block, or a military type code
@@ -204,6 +217,17 @@ struct HeliTrack {
   uint32_t sinceMs;        // when this anchor was set
   uint32_t lastSeenMs;
   bool     loitering;
+  // Alert bookkeeping, separate from "seen". Every voice is gated on
+  // BUZZER_RANGE_KM at the moment it would sound, and the search-box edge is
+  // always outside that gate (a 0.2 deg box is 17-22 km from home; the gate is
+  // 15 km), so for anything that flies in, "first sighting" and "first
+  // in-range sighting" are different polls. Gating on the first-seen poll
+  // alone meant the acquisition voice could only ever sound for a contact
+  // that popped into existence already close. These remember whether the
+  // voice has actually sounded, so it fires on the first poll the contact is
+  // close enough, whenever that is.
+  bool     acquireAlerted; // acquisition voice has sounded for this airframe
+  bool     loiterAlerted;  // loiter voice has sounded for this anchor
 };
 const uint8_t MAX_HELI = 4;
 HeliTrack helis[MAX_HELI];
@@ -229,16 +253,24 @@ const uint8_t FC_N = 3;
 Fcast   fcast[FC_N];
 uint8_t fcCount = 0;
 
-// Route / airline / ETA for the current nearest aircraft (from hexdb.io).
+// Route / airline / ETA per callsign (from hexdb.io), cached the same way as
+// airframe identity and for the same reason: on an approach path two aircraft
+// alternate as nearest faster than the screens cycle, and every swap used to
+// cost two fresh TLS round trips (route, then arrival airport) with the
+// display frozen throughout. Negatives are cached too -- a GA tail number
+// never has a route, and re-asking every poll was pure latency.
 struct RouteInfo {
-  char   callsign[10];   // which callsign this data is for
-  char   airline[18];
-  char   dep[6];
-  char   arr[6];
-  bool   haveRoute;
-  bool   haveArrPos;
-  double arrLat, arrLon;
-} routeInfo;
+  char     callsign[10];   // which callsign this data is for ("" = free slot)
+  char     airline[18];
+  char     dep[6];
+  char     arr[6];
+  bool     haveRoute;
+  bool     haveArrPos;
+  float    arrLat, arrLon; // float is plenty for an ETA over hundreds of km
+  uint32_t touchedMs;      // last hit, for LRU eviction
+};
+const uint8_t ROUTE_CACHE_N = 8;
+RouteInfo routeCache[ROUTE_CACHE_N];
 
 // Identity of the current nearest airframe, resolved by icao24 and cached so a
 // lookup only fires when the contact changes. A negative result is cached too
@@ -300,8 +332,8 @@ const uint32_t SCREEN_SWAP_MS[NUM_SCREENS] = {
   12000,  // TARGET
   12000,  // INTEL
   12000,  // WEAPONS
-   7000,  // WX
-   7000,  // SYSTEM
+   5000,  // WX
+   3000,  // SYSTEM -- a glance at the clock and link status is all it needs
 };
 
 // ---------------------------------------------------------------------------
@@ -661,26 +693,41 @@ bool isRotor(int cat) { return cat == 8; }
 
 // Fold one rotorcraft sighting into the tracking table. Returns true if this
 // airframe currently counts as loitering. Called once per rotorcraft per fetch.
-bool trackRotorcraft(const char* icao, double lat, double lon) {
+// `distanceKm` is the contact's range from home, already computed by the
+// caller. It gates both voices on the first poll the contact is inside
+// BUZZER_RANGE_KM, not only on the poll it appeared -- see HeliTrack.
+bool trackRotorcraft(const char* icao, double lat, double lon, double distanceKm) {
   uint32_t now = millis();
   if (icao == nullptr || icao[0] == '\0') return false;
+  bool inRange = distanceKm <= BUZZER_RANGE_KM;
 
   for (uint8_t i = 0; i < heliCount; i++) {
     if (strcmp(helis[i].icao24, icao) != 0) continue;
     helis[i].lastSeenMs = now;
     if (haversineKm(helis[i].refLat, helis[i].refLon, lat, lon) > LOITER_RADIUS_KM) {
-      helis[i].refLat    = lat;    // moved on: re-anchor, it is transiting
-      helis[i].refLon    = lon;
-      helis[i].sinceMs   = now;
-      helis[i].loitering = false;
+      helis[i].refLat        = lat;    // moved on: re-anchor, it is transiting
+      helis[i].refLon        = lon;
+      helis[i].sinceMs       = now;
+      helis[i].loitering     = false;
+      helis[i].loiterAlerted = false;  // a fresh anchor is a fresh orbit
     } else if (!helis[i].loitering &&
                (uint32_t)(now - helis[i].sinceMs) >= LOITER_MIN_MS) {
       helis[i].loitering = true;
       Serial.printf("[heli] %s loitering: %lu min within %.1f km\n",
                     icao, (unsigned long)((now - helis[i].sinceMs) / 60000UL),
                     (double)LOITER_RADIUS_KM);
-      if (haversineKm(HOME_LAT, HOME_LON, lat, lon) <= BUZZER_RANGE_KM)
-        buzzerLoiter();
+    }
+
+    // One voice per poll. If both fall due together -- a contact that latches
+    // and closes inside the gate on the same fetch -- loiter is the more
+    // specific fact, and the acquisition is marked done rather than queued
+    // behind it, since buzzerChirp() would drop the second anyway.
+    if (inRange) {
+      bool acquireDue = !helis[i].acquireAlerted;
+      bool loiterDue  = helis[i].loitering && !helis[i].loiterAlerted;
+      helis[i].acquireAlerted = true;
+      if (loiterDue) { helis[i].loiterAlerted = true; buzzerLoiter(); }
+      else if (acquireDue) buzzerAcquire();
     }
     return helis[i].loitering;
   }
@@ -698,37 +745,50 @@ bool trackRotorcraft(const char* icao, double lat, double lon) {
   }
   strncpy(helis[slot].icao24, icao, sizeof(helis[slot].icao24) - 1);
   helis[slot].icao24[sizeof(helis[slot].icao24) - 1] = '\0';
-  helis[slot].refLat     = lat;
-  helis[slot].refLon     = lon;
-  helis[slot].sinceMs    = now;
-  helis[slot].lastSeenMs = now;
-  helis[slot].loitering  = false;
+  helis[slot].refLat         = lat;
+  helis[slot].refLon         = lon;
+  helis[slot].sinceMs        = now;
+  helis[slot].lastSeenMs     = now;
+  helis[slot].loitering      = false;
+  helis[slot].acquireAlerted = inRange;
+  helis[slot].loiterAlerted  = false;
   Serial.printf("[heli] new contact %s\n", icao);
-  if (haversineKm(HOME_LAT, HOME_LON, lat, lon) <= BUZZER_RANGE_KM)
-    buzzerAcquire();
+  if (inRange) buzzerAcquire();
   return false;
 }
 
-// Drop helicopters we have not heard from in a while, so a departed aircraft
-// does not keep its slot (or come back still flagged as loitering).
-// Military contacts already announced, so the alert fires on arrival rather
-// than every poll for as long as one is overhead. Same shape as helis[] and for
-// the same reason: blips[] is rebuilt each fetch and cannot remember anything.
-// Four slots is plenty -- in 50 minutes of sampling this airspace produced
-// zero military contacts, so the expected occupancy is nought or one.
-struct MilTrack { char icao24[8]; uint32_t lastSeenMs; };
+// Military contacts already seen, so the log line fires on arrival rather than
+// every poll for as long as one is overhead. Same shape as helis[] and for the
+// same reason: blips[] is rebuilt each fetch and cannot remember anything.
+// Sizing is MAX_MIL in config.h -- set for a formation, not the typical case,
+// because overflow re-announces every poll.
+struct MilTrack {
+  char     icao24[8];
+  uint32_t lastSeenMs;
+  bool     alerted;     // the voice has sounded -- separate from "seen" for the
+                        // reason given at HeliTrack
+};
 MilTrack milSeen[MAX_MIL];
 uint8_t  milCount = 0;
 
-// Fold one military sighting in. Returns true only on the poll it first
-// appears, which is when the alert should sound.
-bool trackMilitary(const char* icao) {
+// Fold one military sighting in. Returns true only on the poll the airframe
+// first appears, for the log. `alert` is set on the poll the voice should
+// sound: the first one with the contact inside BUZZER_RANGE_KM. Those are
+// usually different polls -- a contact flying in is first seen at the box
+// edge, 17-22 km out, and only later closes inside the 15 km gate. Gating the
+// voice on the first-seen poll alone meant it could never sound for anything
+// that did not pop into existence already close, which in practice was almost
+// everything.
+bool trackMilitary(const char* icao, double distanceKm, bool& alert) {
+  alert = false;
   if (icao == nullptr || icao[0] == '\0') return false;
   uint32_t now = millis();
+  bool inRange = distanceKm <= BUZZER_RANGE_KM;
 
   for (uint8_t i = 0; i < milCount; i++) {
     if (strcmp(milSeen[i].icao24, icao) == 0) {
       milSeen[i].lastSeenMs = now;
+      if (inRange && !milSeen[i].alerted) { milSeen[i].alerted = true; alert = true; }
       return false;                       // already announced
     }
   }
@@ -744,6 +804,8 @@ bool trackMilitary(const char* icao) {
   strncpy(milSeen[slot].icao24, icao, sizeof(milSeen[0].icao24) - 1);
   milSeen[slot].icao24[sizeof(milSeen[0].icao24) - 1] = '\0';
   milSeen[slot].lastSeenMs = now;
+  milSeen[slot].alerted    = inRange;
+  alert = inRange;
   return true;
 }
 
@@ -781,6 +843,8 @@ void dropRotorcraft(const char* icao, const char* icaoType) {
   }
 }
 
+// Drop helicopters we have not heard from in a while, so a departed aircraft
+// does not keep its slot (or come back still flagged as loitering).
 void expireRotorcraft() {
   uint32_t now = millis();
   uint8_t  w   = 0;
@@ -1046,6 +1110,10 @@ bool fetchAircraft() {
     // speed, altitude or range -- unlike identity, which is gated.
     bool mil = isMilitary(hexId, known);
 
+    // A missing track is NAN like the other kinematics: 0 would dead-reckon
+    // the blip due north and point the TARGET arrow there.
+    float trackDeg = s[10].isNull() ? NAN : s[10].as<float>();
+
 #if LOG_BLIP_DUMP
     // One line per contact so a rotorcraft or military contact seen on
     // FlightRadar can be matched against what the gates actually decided --
@@ -1062,32 +1130,39 @@ bool fetchAircraft() {
 
     if (mil) {
       milSeen4Poll++;
-      if (trackMilitary(hexId)) {
+      bool alert;
+      if (trackMilitary(hexId, d, alert))
         Serial.printf("[mil] new contact %s %s d=%.1fkm type=%s\n",
                       hexId, (const char*)(s[1] | ""), d, known[0] ? known : "?");
-#if BUZZER_ENABLE
-        // Same range gate as every other voice: something 25 km away is not
-        // worth a noise, and quiet hours still apply via buzzerService().
-        if (d <= BUZZER_RANGE_KM && !buzzerQuietNow()) buzzerMilitary();
-#endif
-      }
+      // Range is gated inside trackMilitary(); quiet hours inside buzzerChirp().
+      if (alert) buzzerMilitary();
     }
 
     bool loiter = false;
     if (isRotor(cat)) {
       rotorSeen++;
-      loiter = trackRotorcraft(s[0] | "", lat, lon);
+      loiter = trackRotorcraft(hexId, lat, lon, d);
     }
 
     if (blipCount < MAX_BLIPS) {
-      blips[blipCount].lat     = lat;
-      blips[blipCount].lon     = lon;
-      blips[blipCount].track   = s[10] | 0.0f;
-      blips[blipCount].speedMs = onGround ? 0.0f : velMs;
-      blips[blipCount].cat     = (uint8_t)cat;
-      blips[blipCount].loiter  = loiter;
-      blips[blipCount].mil     = mil;
-      blipCount++;
+      // Flat east/north km from the range and bearing already in hand, with
+      // the velocity resolved onto the same axes so the radar dead-reckons with
+      // one multiply per axis. Unknown speed or track means the blip holds
+      // still, which is honest -- guessing a heading would creep it wrongly.
+      Blip& b = blips[blipCount++];
+      double brgRad = deg2rad(brg);
+      b.x = (float)(d * sin(brgRad));
+      b.y = (float)(d * cos(brgRad));
+      if (!onGround && isfinite(velMs) && isfinite(trackDeg) && velMs > 0.0f) {
+        double trkRad = deg2rad(trackDeg);
+        b.vx = (float)(velMs * sin(trkRad) / 1000.0);
+        b.vy = (float)(velMs * cos(trkRad) / 1000.0);
+      } else {
+        b.vx = b.vy = 0.0f;
+      }
+      b.cat    = (uint8_t)cat;
+      b.loiter = loiter;
+      b.mil    = mil;
     }
 
     if (d < best.distanceKm) {
@@ -1095,15 +1170,11 @@ bool fetchAircraft() {
       best.lat        = lat;
       best.lon        = lon;
       best.bearingDeg = brg;
-      best.onGround   = s[8] | false;
+      best.onGround   = onGround;
       best.category   = s[17] | 0;
-
-      // geo altitude (13) preferred, fall back to barometric (7), then NAN --
-      // see the note above; isfinite() guards downstream depend on it.
-      best.altitudeM  = s[13].isNull() ? (s[7].isNull() ? NAN : s[7].as<float>())
-                                       : s[13].as<float>();
-      best.velocityMs = s[9].isNull() ? NAN : s[9].as<float>();
-      best.trackDeg   = s[10] | 0.0f;
+      best.altitudeM  = altM;       // NAN when OpenSky left both altitudes null
+      best.velocityMs = velMs;      // ditto; isfinite() guards downstream rely on it
+      best.trackDeg   = trackDeg;
       best.vrateMs    = s[11] | 0.0f;
 
       const char* cs = s[1] | "";
@@ -1165,17 +1236,24 @@ bool fetchWeather() {
   url += "&hourly=temperature_2m,weather_code&forecast_hours=8&timezone=auto";
   if (!https.begin(client, url)) return false;
 
+  // Same shape as the OpenSky fetch, for the same reason: HTTP/1.0 rules out
+  // chunked encoding, which is what let getString() hand back a silently
+  // truncated body under TLS-buffer memory pressure -- and with chunking gone
+  // the parser can read the socket directly, with no body String at all.
+  https.useHTTP10(true);
   int code = https.GET();
   Serial.printf("[wx] HTTP %d\n", code);
   if (code != HTTP_CODE_OK) { https.end(); return false; }
-  String payload = https.getString();
-  https.end();
 
   JsonDocument filter;
   filter["current"] = true;
-  filter["hourly"]  = true;
+  filter["hourly"]["temperature_2m"] = true;
+  filter["hourly"]["weather_code"]   = true;
   JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return false;
+  DeserializationError err = deserializeJson(doc, https.getStream(),
+                                             DeserializationOption::Filter(filter));
+  https.end();
+  if (err) { Serial.printf("[wx] JSON error: %s\n", err.c_str()); return false; }
   JsonObject c = doc["current"];
   if (c.isNull()) return false;
 
@@ -1298,52 +1376,89 @@ const char* airlineName(const char* callsign) {
   return fb;   // unknown -> show the 3-letter operator code
 }
 
-// Look up departure/arrival airports (and arrival coords for ETA) for a
-// callsign. Always fills the airline; route/ETA are best-effort.
-void fetchRoute(const char* callsign) {
-  strncpy(routeInfo.airline, airlineName(callsign), sizeof(routeInfo.airline) - 1);
-  routeInfo.airline[sizeof(routeInfo.airline) - 1] = '\0';
-  routeInfo.haveRoute = false;
-  routeInfo.haveArrPos = false;
-  routeInfo.dep[0] = routeInfo.arr[0] = '\0';
-  strncpy(routeInfo.callsign, callsign, sizeof(routeInfo.callsign) - 1);
-  routeInfo.callsign[sizeof(routeInfo.callsign) - 1] = '\0';
+// Cached route for `callsign`, or nullptr if it has never been looked up. A
+// hit counts as known even with haveRoute false -- that is a cached negative.
+RouteInfo* routeFor(const char* callsign) {
+  if (callsign == nullptr || callsign[0] == '\0') return nullptr;
+  for (uint8_t i = 0; i < ROUTE_CACHE_N; i++) {
+    if (routeCache[i].callsign[0] && strcmp(routeCache[i].callsign, callsign) == 0) {
+      routeCache[i].touchedMs = millis();
+      return &routeCache[i];
+    }
+  }
+  return nullptr;
+}
 
-  String payload;
-  if (httpGetString(String("https://hexdb.io/api/v1/route/icao/") + callsign, payload)) {
-    JsonDocument d;
-    if (!deserializeJson(d, payload)) {
-      const char* r = d["route"] | "";
-      const char* dash = strchr(r, '-');
-      if (r[0] && dash) {
-        size_t dl = dash - r;
-        if (dl < sizeof(routeInfo.dep)) {
-          strncpy(routeInfo.dep, r, dl);
-          routeInfo.dep[dl] = '\0';
-          strncpy(routeInfo.arr, dash + 1, sizeof(routeInfo.arr) - 1);
-          routeInfo.arr[sizeof(routeInfo.arr) - 1] = '\0';
-          routeInfo.haveRoute = true;
+// Does this callsign look like an airline flight -- a three-letter ICAO
+// operator designator followed by a flight number? Anything else (an
+// N-number, a bare registration, "(no id)") is GA, hexdb has no route for it,
+// and the two TLS round trips are skipped: only the offline airline table runs.
+bool callsignLooksAirline(const char* cs) {
+  if (cs == nullptr || strlen(cs) < 4) return false;
+  for (uint8_t i = 0; i < 3; i++)
+    if (!isalpha((unsigned char)cs[i])) return false;
+  return isdigit((unsigned char)cs[3]) != 0;
+}
+
+// Look up departure/arrival airports (and arrival coords for ETA) for a
+// callsign and cache the answer. Always fills the airline; route/ETA are
+// best-effort and only queried for callsigns that could plausibly have one.
+void fetchRoute(const char* callsign) {
+  // Slot: a free one, else the least recently touched.
+  RouteInfo* r = &routeCache[0];
+  for (uint8_t i = 0; i < ROUTE_CACHE_N; i++) {
+    if (!routeCache[i].callsign[0]) { r = &routeCache[i]; break; }
+    if ((int32_t)(routeCache[i].touchedMs - r->touchedMs) < 0) r = &routeCache[i];
+  }
+
+  strncpy(r->airline, airlineName(callsign), sizeof(r->airline) - 1);
+  r->airline[sizeof(r->airline) - 1] = '\0';
+  r->haveRoute  = false;
+  r->haveArrPos = false;
+  r->dep[0] = r->arr[0] = '\0';
+  strncpy(r->callsign, callsign, sizeof(r->callsign) - 1);
+  r->callsign[sizeof(r->callsign) - 1] = '\0';
+  r->touchedMs = millis();
+
+  bool query = callsignLooksAirline(callsign);
+  if (query) {
+    String payload;
+    if (httpGetString(String("https://hexdb.io/api/v1/route/icao/") + callsign, payload)) {
+      JsonDocument d;
+      if (!deserializeJson(d, payload)) {
+        const char* rt   = d["route"] | "";
+        const char* dash = strchr(rt, '-');
+        if (rt[0] && dash) {
+          size_t dl = dash - rt;
+          if (dl < sizeof(r->dep)) {
+            strncpy(r->dep, rt, dl);
+            r->dep[dl] = '\0';
+            strncpy(r->arr, dash + 1, sizeof(r->arr) - 1);
+            r->arr[sizeof(r->arr) - 1] = '\0';
+            r->haveRoute = true;
+          }
+        }
+      }
+    }
+
+    if (r->haveRoute && r->arr[0]) {
+      String ap;
+      if (httpGetString(String("https://hexdb.io/api/v1/airport/icao/") + r->arr, ap)) {
+        JsonDocument d;
+        if (!deserializeJson(d, ap) && !d["latitude"].isNull()) {
+          r->arrLat = d["latitude"]  | 0.0f;
+          r->arrLon = d["longitude"] | 0.0f;
+          r->haveArrPos = true;
         }
       }
     }
   }
 
-  if (routeInfo.haveRoute && routeInfo.arr[0]) {
-    String ap;
-    if (httpGetString(String("https://hexdb.io/api/v1/airport/icao/") + routeInfo.arr, ap)) {
-      JsonDocument d;
-      if (!deserializeJson(d, ap) && !d["latitude"].isNull()) {
-        routeInfo.arrLat = d["latitude"]  | 0.0;
-        routeInfo.arrLon = d["longitude"] | 0.0;
-        routeInfo.haveArrPos = true;
-      }
-    }
-  }
-
-  Serial.printf("[route] %s %s %s>%s eta=%s\n", callsign, routeInfo.airline,
-                routeInfo.haveRoute ? routeInfo.dep : "?",
-                routeInfo.haveRoute ? routeInfo.arr : "?",
-                routeInfo.haveArrPos ? "yes" : "no");
+  Serial.printf("[route] %s %s %s>%s eta=%s%s\n", callsign, r->airline,
+                r->haveRoute ? r->dep : "?",
+                r->haveRoute ? r->arr : "?",
+                r->haveArrPos ? "yes" : "no",
+                query ? "" : " (GA, not queried)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1494,7 @@ static uint16_t chirpFreq   = 0;
 static uint16_t chirpOnMs   = 0;
 static uint16_t chirpGapMs  = 0;
 static uint32_t chirpNextMs = 0;
+static uint8_t  chirpPrio   = 0;       // priority of the pattern in flight
 
 // Suppress alerts overnight. Falls open (audible) until NTP has synced, so a
 // clock that never sets cannot silence the buzzer forever.
@@ -1393,11 +1509,23 @@ bool buzzerQuietNow() {
   return h >= BUZZER_QUIET_START || h < BUZZER_QUIET_END;     // wraps midnight
 }
 
-// Queue a pattern. A pattern already in flight wins, so a sweep blip cannot
-// stomp on the tail of a loiter alert.
-void buzzerChirp(uint8_t count, uint16_t freq, uint16_t onMs, uint16_t gapMs) {
-  if (chirpsLeft > 0 || chirpOn) return;
+// Queue a pattern. A pattern already in flight keeps the pin unless the new
+// one outranks it: the sweep tick is priority 0 and the three alerts are 1, so
+// a tick cannot stomp on the tail of a loiter alert, but a military trill
+// arriving while a 25 ms tick happens to be sounding replaces the tick instead
+// of being lost -- and it was being lost, because fetches land at arbitrary
+// points in the sweep. Equal priority is first-come, so alerts never cut each
+// other short.
+void buzzerChirp(uint8_t prio, uint8_t count, uint16_t freq, uint16_t onMs, uint16_t gapMs) {
+  bool busy = chirpsLeft > 0 || chirpOn;
+  if (busy && prio <= chirpPrio) return;
   if (buzzerQuietNow()) return;
+  if (chirpOn) {                          // cut the outranked tone right now
+    noTone(PIN_BUZZER);
+    digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+    chirpOn = false;
+  }
+  chirpPrio   = prio;
   chirpsLeft  = count;
   chirpFreq   = freq;
   chirpOnMs   = onMs;
@@ -1429,32 +1557,51 @@ void buzzerService() {
   }
 }
 
-// The three voices, deliberately distinguishable without looking at the screen.
-// All sit inside the 2-5 kHz band where these piezo elements are loudest;
-// below ~2 kHz they go noticeably quiet.
+// Stop a tone that is sounding right now but keep the rest of the pattern
+// queued. loop() calls this before the fetch block: nothing services the
+// buzzer for the seconds a fetch and its identity lookups take, so a chirp that
+// happened to be on at that instant used to stay on for all of it -- a
+// multi-second howl instead of a 25 ms tick. The pattern resumes on the first
+// service call after the fetch returns.
+void buzzerPause() {
+  if (!chirpOn) return;
+  noTone(PIN_BUZZER);
+  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+  chirpOn     = false;
+  chirpNextMs = millis() + chirpGapMs;
+}
+
 // Four voices, deliberately separated on both axes the element can express --
 // pitch and rhythm -- because on a single piezo that is all there is to work
 // with. Read down the list: pitch falls as the pulses get longer and fewer.
 // Military is the odd one out at the top: fastest and highest, a trill rather
 // than a beat, so it does not read as "more of the rotorcraft alert".
 // All four stay inside the 2-5 kHz band these elements actually project.
-void buzzerSweepBlip()  { buzzerChirp(1, 4000,  25,  40); }  // crisp tick
-void buzzerMilitary()   { buzzerChirp(4, 4500,  40,  45); }  // fast high trill
-void buzzerAcquire()    { buzzerChirp(2, 3000,  60,  70); }  // two-tone
-void buzzerLoiter()     { buzzerChirp(3, 2200, 120, 100); }  // lowest, insistent
+// First argument is priority: the tick yields to any alert (see buzzerChirp).
+void buzzerSweepBlip()  { buzzerChirp(0, 1, 4000,  25,  40); }  // crisp tick
+void buzzerMilitary()   { buzzerChirp(1, 4, 4500,  40,  45); }  // fast high trill
+void buzzerAcquire()    { buzzerChirp(1, 2, 3000,  60,  70); }  // two-tone
+void buzzerLoiter()     { buzzerChirp(1, 3, 2200, 120, 100); }  // lowest, insistent
 
 #else
 inline bool buzzerQuietNow() { return true; }
-inline void buzzerChirp(uint8_t, uint16_t, uint16_t, uint16_t) {}
+inline void buzzerChirp(uint8_t, uint8_t, uint16_t, uint16_t, uint16_t) {}
 inline void buzzerService()  {}
+inline void buzzerPause()    {}
 inline void buzzerSweepBlip(){}
 inline void buzzerMilitary() {}
 inline void buzzerAcquire()  {}
 inline void buzzerLoiter()   {}
 #endif
 
+// Radar sweep angle for this instant: ~4.3 s per clockwise turn.
+float sweepAngleNow() { return fmodf(millis() / 12.0f, 360.0f); }
+
 // Sweep angle on the previous radar frame, so the sweep-crossing blip can tell
-// which bearings the beam passed over since last time.
+// which bearings the beam passed over since last time. loop() re-seeds it as
+// the RADAR page comes back around: left stale for a minute it landed inside
+// the 30 deg window about one return in twelve and fired a tick for whatever
+// sat in that arc.
 float prevSweepDeg = 0.0f;
 
 // True if the sweep crossed `target` between the previous frame and this one.
@@ -1956,18 +2103,25 @@ AirframeClass nearestAirframe() {
   return classifyAirframeFrom(effectiveCategory(nearest), acTypeFor(nearest.icao24));
 }
 
-// Is the current target a rotorcraft, and is it holding station?
-bool nearestIsRotor()  {
-  return nearest.valid && nearestAirframe() == AirframeClass::HELICOPTER;
-}
-bool nearestLoitering() { return nearestIsRotor() && isLoitering(nearest.icao24); }
+// Rotor / loiter / military for the nearest contact, resolved once per poll.
+// Each answer costs a scan of the identity cache plus a walk of a PROGMEM type
+// list, and TARGET wanted all three every frame while loop() wanted one for
+// the dwell. None of the inputs change between polls, so loop() computes them
+// once, after the fetch and its identity lookups have both run.
+struct NearestFlags { bool rotor, loiter, mil; };
+NearestFlags nearestFlags;
 
-// Military by address block, or by a resolved type code. The nearest contact is
-// always looked up, so the type-code half is genuinely available here even
-// though it is not for most blips.
-bool nearestIsMilitary() {
-  return nearest.valid && isMilitary(nearest.icao24, acTypeFor(nearest.icao24));
+void refreshNearestFlags() {
+  nearestFlags.rotor  = nearest.valid && nearestAirframe() == AirframeClass::HELICOPTER;
+  nearestFlags.loiter = nearestFlags.rotor && isLoitering(nearest.icao24);
+  // Military by address block, or by a resolved type code. The nearest contact
+  // is always looked up, so the type-code half is genuinely available here
+  // even though it is not for most blips.
+  nearestFlags.mil    = nearest.valid && isMilitary(nearest.icao24, acTypeFor(nearest.icao24));
 }
+bool nearestIsRotor()    { return nearestFlags.rotor;  }
+bool nearestLoitering()  { return nearestFlags.loiter; }
+bool nearestIsMilitary() { return nearestFlags.mil;    }
 
 void screenNearest() {
   drawHeader("TARGET");
@@ -2000,8 +2154,9 @@ void screenNearest() {
     u8g2.drawStr(0, 54, "alt --");
   }
 
-  // heading arrow + speed on the right
-  drawArrow(110, 34, 11, nearest.trackDeg);
+  // heading arrow + speed on the right ("--" when OpenSky gave no track)
+  if (isfinite(nearest.trackDeg)) drawArrow(110, 34, 11, nearest.trackDeg);
+  else                            u8g2.drawStr(104, 38, "--");
   if (isfinite(nearest.velocityMs)) snprintf(line, sizeof(line), "%.0f", nearest.velocityMs * 3.6); // km/h
   else                              snprintf(line, sizeof(line), "--");
   u8g2.setFont(u8g2_font_4x6_tr);
@@ -2064,24 +2219,24 @@ void screenDetails() {
     return;
   }
 
-  bool haveRoute = (strcmp(routeInfo.callsign, nearest.callsign) == 0);
+  const RouteInfo* rt = routeFor(nearest.callsign);   // nullptr until fetched
   char line[32];
 
   u8g2.setFont(u8g2_font_6x12_tr);
   u8g2.drawStr(0, 20, nearest.callsign);
 
   u8g2.setFont(u8g2_font_5x7_tr);
-  snprintf(line, sizeof(line), "LINE %s", haveRoute ? routeInfo.airline : airlineName(nearest.callsign));
+  snprintf(line, sizeof(line), "LINE %s", rt ? rt->airline : airlineName(nearest.callsign));
   u8g2.drawStr(0, 31, line);
 
-  if (haveRoute && routeInfo.haveRoute)
-    snprintf(line, sizeof(line), "RTE  %s > %s", routeInfo.dep, routeInfo.arr);
+  if (rt && rt->haveRoute)
+    snprintf(line, sizeof(line), "RTE  %s > %s", rt->dep, rt->arr);
   else
     snprintf(line, sizeof(line), "RTE  unknown");
   u8g2.drawStr(0, 41, line);
 
-  if (haveRoute && routeInfo.haveArrPos && nearest.velocityMs > 20) {
-    double dk  = haversineKm(nearest.lat, nearest.lon, routeInfo.arrLat, routeInfo.arrLon);
+  if (rt && rt->haveArrPos && nearest.velocityMs > 20) {
+    double dk  = haversineKm(nearest.lat, nearest.lon, rt->arrLat, rt->arrLon);
     int    min = (int)(dk / (nearest.velocityMs * 3.6) * 60.0);
     snprintf(line, sizeof(line), "ETA  %dh%02dm  %.0fkm", min / 60, min % 60, dk);
   } else {
@@ -2091,11 +2246,13 @@ void screenDetails() {
 
   const char* reg = acRegFor(nearest.icao24);
   const char* typ = acTypeFor(nearest.icao24);
+  char hdg[4];
+  if (isfinite(nearest.trackDeg)) snprintf(hdg, sizeof(hdg), "%03.0f", nearest.trackDeg);
+  else                            strcpy(hdg, "---");
   if (reg[0] || typ[0])
-    snprintf(line, sizeof(line), "%s %s HDG %03.0f",
-             reg[0] ? reg : nearest.icao24, typ, nearest.trackDeg);
+    snprintf(line, sizeof(line), "%s %s HDG %s", reg[0] ? reg : nearest.icao24, typ, hdg);
   else
-    snprintf(line, sizeof(line), "ID %s HDG %03.0f", nearest.icao24, nearest.trackDeg);
+    snprintf(line, sizeof(line), "ID %s HDG %s", nearest.icao24, hdg);
   u8g2.drawStr(0, 61, line);
 }
 
@@ -2130,27 +2287,24 @@ void screenRadar() {
   }
 
   // rotating sweep (~4 s/turn, clockwise)
-  float sweepDeg = fmodf(millis() / 12.0f, 360.0f);
+  float sweepDeg = sweepAngleNow();
   double sw = deg2rad(sweepDeg);
   u8g2.drawLine(cx, cy, cx + (int)(sin(sw) * R), cy - (int)(cos(sw) * R));
 
-  // blips, dead-reckoned + persistence
-  int   nearIdx = -1;
-  float nearD   = 1e9;
+  // blips, dead-reckoned + persistence. All float and flat -- see struct Blip.
+  const float PX_PER_KM = (float)R / MAX_KM;
+  int   nearBx = 0, nearBy = 0;
+  float nearD  = 1e9f;
   for (uint8_t i = 0; i < blipCount; i++) {
-    double la = blips[i].lat, lo = blips[i].lon;
-    if (blips[i].speedMs > 0 && elapsed > 0)
-      projectLatLon(blips[i].lat, blips[i].lon, blips[i].track,
-                    blips[i].speedMs * elapsed, la, lo);
-    double dist = haversineKm(HOME_LAT, HOME_LON, la, lo);
-    if (dist < nearD) { nearD = dist; nearIdx = i; }
-
-    float fr = (float)(dist / MAX_KM);
-    if (fr > 1) continue;
-    int rr  = (int)(fr * R);
-    double brg = bearingDeg(HOME_LAT, HOME_LON, la, lo);
-    int bx = cx + (int)(sin(deg2rad(brg)) * rr);
-    int by = cy - (int)(cos(deg2rad(brg)) * rr);
+    float x    = blips[i].x + blips[i].vx * elapsed;
+    float y    = blips[i].y + blips[i].vy * elapsed;
+    float dist = sqrtf(x * x + y * y);
+    if (dist > MAX_KM) continue;
+    int bx = cx + (int)lroundf(x * PX_PER_KM);
+    int by = cy - (int)lroundf(y * PX_PER_KM);
+    if (dist < nearD) { nearD = dist; nearBx = bx; nearBy = by; }
+    float brg = (float)rad2deg(atan2(x, y));
+    if (brg < 0.0f) brg += 360.0f;
 
     if (isRotor(blips[i].cat)) {
       // A cross reads as distinct from the plain dots even at this scale, and
@@ -2166,11 +2320,11 @@ void screenRadar() {
       // up, which keeps it to a few ticks per screen cycle instead of a sonar.
       // The crossing geometry, range gate and chirp queue are hardware-verified;
       // only the rotor-only path itself still awaits a live helicopter.
-      if (dist <= BUZZER_RANGE_KM && sweptPast(prevSweepDeg, sweepDeg, (float)brg))
+      if (dist <= BUZZER_RANGE_KM && sweptPast(prevSweepDeg, sweepDeg, brg))
         buzzerSweepBlip();
 #endif
     } else {
-      float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
+      float behind = fmodf(sweepDeg - brg + 360.0f, 360.0f);
       if (behind < 50) u8g2.drawDisc(bx, by, 1);   // freshly swept
       else             u8g2.drawPixel(bx, by);     // fading
     }
@@ -2179,21 +2333,9 @@ void screenRadar() {
   prevSweepDeg = sweepDeg;
 
   // highlight the closest live contact
-  if (nearIdx >= 0) {
-    double la = blips[nearIdx].lat, lo = blips[nearIdx].lon;
-    if (blips[nearIdx].speedMs > 0 && elapsed > 0)
-      projectLatLon(blips[nearIdx].lat, blips[nearIdx].lon, blips[nearIdx].track,
-                    blips[nearIdx].speedMs * elapsed, la, lo);
-    double dist = haversineKm(HOME_LAT, HOME_LON, la, lo);
-    double brg  = bearingDeg(HOME_LAT, HOME_LON, la, lo);
-    float fr = (float)(dist / MAX_KM);
-    if (fr <= 1) {
-      int rr = (int)(fr * R);
-      int bx = cx + (int)(sin(deg2rad(brg)) * rr);
-      int by = cy - (int)(cos(deg2rad(brg)) * rr);
-      u8g2.drawCircle(bx, by, 3);
-      u8g2.drawDisc(bx, by, 1);
-    }
+  if (nearD <= MAX_KM) {
+    u8g2.drawCircle(nearBx, nearBy, 3);
+    u8g2.drawDisc(nearBx, nearBy, 1);
   }
 
   // side info panel
@@ -2481,10 +2623,14 @@ void loop() {
   uint32_t now = millis();
 
   if (!firstFetchDone || now - lastPoll >= UPDATE_INTERVAL_MS) {
+    // Nothing services the buzzer for the seconds the fetches take, so a tone
+    // that is on right now would stay on for all of them. Park it first.
+    buzzerPause();
     if (WiFi.status() != WL_CONNECTED) connectWiFi();
     fetchAircraft();
-    if (nearest.valid && strcmp(routeInfo.callsign, nearest.callsign) != 0)
-      fetchRoute(nearest.callsign);
+    // Route is keyed by callsign and cached; a hit costs nothing, and a GA
+    // callsign never leaves the device (see fetchRoute).
+    if (nearest.valid && !routeFor(nearest.callsign)) fetchRoute(nearest.callsign);
     // Identity is keyed by airframe, not callsign. The nearest contact is
     // always resolved first and unconditionally -- it drives TARGET, INTEL and
     // WEAPONS, so it must never lose out to a queued candidate. fetchAircraftInfo
@@ -2496,6 +2642,8 @@ void loop() {
     // first, bounded by AC_LOOKUP_MAX_PER_POLL. Deliberately after the fetch:
     // each lookup builds its own TLS client and must not overlap OpenSky's.
     acDrainQueue();
+    // Now that identity is as resolved as it is going to get this poll.
+    refreshNearestFlags();
     lastPoll = now;
     firstFetchDone = true;
   }
@@ -2514,6 +2662,9 @@ void loop() {
   if (now - lastScreenSwap >= dwell) {
     screen = (screen + 1) % NUM_SCREENS;
     lastScreenSwap = now;
+    // Coming back to the radar: the sweep-crossing test compares against the
+    // angle from the *previous radar frame*, which is now a minute old.
+    if (screen == SCR_RADAR) prevSweepDeg = sweepAngleNow();
   }
 
   render();
