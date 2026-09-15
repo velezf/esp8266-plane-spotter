@@ -486,7 +486,9 @@ firing authorization is unconditionally withheld (the `AUTH:HOLD` label was
 removed from the page as constant noise; the policy stands), and nothing is
 connected to anything. Envelope and
 time-of-flight use published reference figures; **PK is an invented geometric
-heuristic** labelled `NOTNL`, because no public data supports a real one. No
+heuristic**, because no public data supports a real one. It carried a
+`NOTIONAL` suffix on screen until the owner judged that implied by the page
+and had it dropped; the caveat stays in the `calcPk()` comment. No
 no-escape-zone or doctrinal engagement data is represented, for the same reason.
 `SOLUTION` is a bearing delta over `TRACK_LOOKAHEAD_SECONDS`, not a firing
 solution. It was dropped once for space and put back because it is the
@@ -495,8 +497,8 @@ thematic touch; it lives in the sidebar.
 **Layout is a table, 5x7, no graphics.** Two system rows (designation and
 name with the tag; role and branch), a rule, then four rows of label/value
 pairs in two columns (second column at x=68): TGT | ALT, THR | SOL,
-ENV | TOF, PK NOTIONAL. Same content as the original nine-row 4x6 page,
-nothing dropped. It went through a
+ENV | TOF, PK. Same content as the original nine-row 4x6 page, nothing
+dropped but the PK suffix. It went through a
 range-versus-altitude envelope chart with a 4x6 sidebar and came straight
 back: on a 128x64 panel the graphic fought the text and the owner wanted
 something readable from across the room, not a plot. Do not reintroduce
@@ -523,6 +525,35 @@ regenerate the line-width audit rather than eyeballing it — the role/branch
 row is the longest at 24 (`AREA DEFENSE . US/NORWAY`), which is why
 `WS_D_BRN` is `US/NORWAY`, `WS_F_BRN` is `USMC` and `WS_C_NAM` is `STRYKER`
 (the name row has to leave 38 px for the `ORGANIC` tag).
+
+### Spelled-out airframe names
+
+A resolved ICAO type code is drawn as a name, not a code: TARGET shows
+`BOEING 777-300ER` in a 5x7 row directly under the callsign, and the radar
+info panel shows the bare model (`777-300ER`, `UH-60`) beside the type icon.
+This exists because guests watching the panel asked to see "A380" or "777"
+and the code was buried on INTEL, where it still appears raw beside the
+registration.
+
+`airframeName()` looks the code up in `TYPE_NAMES[]`, a PROGMEM table of
+maker + model (~160 entries, what actually flies over the US Northeast),
+then falls back to two family rules — Boeing `B7XY` → `7X7-Y00`, Airbus
+`A33Y`/`A34Y` → `A330-Y00`/`A340-Y00` — and finally to the raw code. Table
+entries win over the rules, which is how the irregulars (`B77W`, `B789`,
+`B748`, the MAX family) get real names. Three-letter codes are stored padded
+to four (`"H60 "`) so one fixed-width field serves all; the query is padded
+the same way.
+
+Width limits are structural, not stylistic: a model is at most **9** characters
+because the radar panel has 48 px of 5x7, and maker + space + model is at
+most **19** because the TARGET row must clear the heading arrow at x=99. The
+compiler enforces the model width through the `char model[10]` field, and
+the TARGET width is why the Bombardier business jets are `CL-300` rather than
+`CHALLENGER 300`. When adding entries, audit the full-name width too — the
+compiler only catches the model.
+
+Records are read with `memcpy_P`; the ESP8266 faults on unaligned byte
+reads from flash. The table costs ~4.5 KB of flash and no DRAM.
 
 ### Type icons
 
@@ -600,8 +631,8 @@ no longer matters much, but do not delete it as a side effect of tidying.
 
 ## Unverified on hardware
 
-Almost everything is verified on real hardware now. Settled — do not
-re-litigate these:
+Everything below is verified on real hardware. Settled — do not re-litigate
+these:
 
 - **Display.** 2.42" SSD1309 on I²C at 0x3C, landscape, NONAME0 init, no reset
   line. All six screens render; the 0.96" SSD1306 remains a one-line fallback.
@@ -618,21 +649,17 @@ re-litigate these:
   and every banner including the combined `MIL ROTOR` and `MIL ROTOR LOIT`.
 - **Identity lookups**, all three tiers, and a type code correcting a wrong
   kinematic guess in flight — watched live on a C172 on approach.
+- **The loiter latch geometry** in `trackRotorcraft()`: a contact staying
+  inside `LOITER_RADIUS_KM` for `LOITER_MIN_MS`. Host-tested first, then seen
+  live on a real helicopter holding station on 2026-09-15.
+- **Range-entry alert gating** (September 2026 alert/perf branch): a PAT
+  flight first logged as `[mil] new contact` beyond `BUZZER_RANGE_KM` sounded
+  the trill on the first poll inside it, watched live on 2026-09-15. That
+  also exercised chirp priority, `buzzerPause()`, the flat-coordinate radar,
+  the route cache and weather over HTTP/1.0 in ordinary running.
 
-**The one thing still unproven is the loiter latch *geometry*** in
-`trackRotorcraft()`: that a contact stayed inside `LOITER_RADIUS_KM` for
-`LOITER_MIN_MS`. It is host-tested, and everything downstream of it is now
-proven on hardware, but the decision itself needs a real helicopter holding
-station.
-
-**Not yet flown (September 2026 alert/perf branch):** the in-range alert
-gating is host-tested (a contact first seen at 20 km alerts exactly once, on
-the first poll inside 15 km; loiter-and-entry on the same poll yields one
-loiter voice; re-anchor re-arms it) but has not sounded on hardware; nor have
-chirp priority preemption, `buzzerPause()`, the flat-coordinate radar, the
-route cache, or weather over HTTP/1.0 with a streamed parse. The weather change
-is the one to watch on the first boot: it mirrors the proven OpenSky path, but
-Open-Meteo has not been seen answering an HTTP/1.0 request from this device.
+Nothing is currently known to be unverified. The rest of this section is
+kept for the next time something is.
 
 **How the rest got closed, because it applies to whatever is unverified next:**
 forcing the state beats waiting for it. Rather than wait weeks for a helicopter,

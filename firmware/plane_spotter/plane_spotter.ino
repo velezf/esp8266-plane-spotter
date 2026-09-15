@@ -1680,7 +1680,8 @@ void projectLatLon(double lat, double lon, float trackDeg, double distM,
 // always denied. Nothing here is connected to anything, no real fire-control
 // or doctrinal engagement logic is implemented, and PK is a display heuristic
 // (see calcPk) rather than a lethality estimate -- there is no public data
-// from which a real one could be derived, so it is labelled NOTIONAL.
+// from which a real one could be derived. It was labelled NOTIONAL on screen
+// until that was judged implied by the page; the caveat now lives here.
 // ---------------------------------------------------------------------------
 
 static const char WS_A_DES[] PROGMEM = "MIM-104";
@@ -1928,7 +1929,7 @@ bool calcInterceptSeconds(const WeaponSystemRecord& w, double distanceKm,
 // PK is invented. There is no public dataset that would let anyone compute a
 // real probability of kill, so rather than dress a fabricated constant up as
 // fact this is an explicit geometric heuristic: best mid-envelope, degraded
-// near the edges, at the ceiling, and off-aspect. Displayed as NOTIONAL.
+// near the edges, at the ceiling, and off-aspect. Do not present it as more.
 bool calcPk(const WeaponSystemRecord& w, double distanceKm, float altitudeFt,
             bool haveAlt, ThreatLevel threat, Envelope env, float& outPk) {
   if (env != Envelope::INSIDE) return false;
@@ -2126,6 +2127,228 @@ const char* typeName(int cat) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Spelled-out airframe names.
+//
+// A resolved ICAO type designator is the most specific fact the device has,
+// but "B77W" means nothing to anyone watching the panel who does not read
+// type codes. Guests asked, in so many words, to see "A380" or "777", so the
+// code is translated to a maker and a model before it is drawn. The table is
+// deliberately what actually flies over the US Northeast corridor rather than
+// an attempt at the full designator list; anything it does not know falls
+// back to the raw code, which is what was shown before and is still correct.
+//
+// Two generic rules cover most of the Boeing and Airbus families so the table
+// does not have to list every 737 and A330 variant: B7XY reads as 7X7-Y00,
+// A33Y / A34Y as A330-Y00 / A340-Y00. Entries in the table win over the
+// rules, which is how the irregular ones (777-300ER, 787-9, 747-8, the MAX
+// family) get their proper names.
+//
+// The table is PROGMEM, so it costs flash and not DRAM; records are read out
+// with memcpy_P because the ESP8266 faults on unaligned byte reads from flash.
+// Model strings are at most 9 characters so the bare model fits the radar
+// info panel (48 px of 5x7), and "MAKER MODEL" is at most 19 so it fits the
+// TARGET row ahead of the heading arrow at x=99.
+// ---------------------------------------------------------------------------
+
+enum Maker : uint8_t {
+  MK_NONE, MK_BOEING, MK_AIRBUS, MK_EMBRAER, MK_BOMBARDIER, MK_CESSNA,
+  MK_PIPER, MK_CIRRUS, MK_BEECH, MK_GULFSTREAM, MK_DASSAULT, MK_LEARJET,
+  MK_PILATUS, MK_SIKORSKY, MK_BELL, MK_ROBINSON, MK_LEONARDO, MK_MDHELI,
+  MK_LOCKHEED, MK_MCDD, MK_ATR, MK_SAAB, MK_DHC, MK_HONDA, MK_DAHER,
+  MK_NORTHROP, MK_MOONEY, MK_DIAMOND, MK_COUNT
+};
+
+// Indexed by Maker. Kept short so MAKER + space + 9-char model stays <= 19.
+static const char MAKER_NAMES[] PROGMEM =
+  "\0"          "BOEING\0"     "AIRBUS\0"     "EMBRAER\0"   "BOMBARDIER\0"
+  "CESSNA\0"    "PIPER\0"      "CIRRUS\0"     "BEECHCRAFT\0" "GULFSTREAM\0"
+  "DASSAULT\0"  "LEARJET\0"    "PILATUS\0"    "SIKORSKY\0"  "BELL\0"
+  "ROBINSON\0"  "LEONARDO\0"   "MD HELI\0"    "LOCKHEED\0"  "MCDONNELL\0"
+  "ATR\0"       "SAAB\0"       "DHC\0"        "HONDA\0"     "DAHER\0"
+  "NORTHROP\0"  "MOONEY\0"     "DIAMOND\0";
+
+struct TypeNameRec { char code[5]; uint8_t maker; char model[10]; };
+
+static const TypeNameRec TYPE_NAMES[] PROGMEM = {
+  // Boeing irregulars (the B7XY rule handles the rest)
+  {"B748", MK_BOEING, "747-8"},     {"B77W", MK_BOEING, "777-300ER"},
+  {"B77L", MK_BOEING, "777-200LR"}, {"B778", MK_BOEING, "777-8"},
+  {"B779", MK_BOEING, "777-9"},     {"B788", MK_BOEING, "787-8"},
+  {"B789", MK_BOEING, "787-9"},     {"B78X", MK_BOEING, "787-10"},
+  {"B37M", MK_BOEING, "737 MAX 7"}, {"B38M", MK_BOEING, "737 MAX 8"},
+  {"B39M", MK_BOEING, "737 MAX 9"}, {"B3XM", MK_BOEING, "737 MAX10"},
+  {"B74S", MK_BOEING, "747SP"},     {"B74F", MK_BOEING, "747 FRTR"},
+  {"B06 ", MK_BELL,   "206"},
+  // Airbus
+  {"A318", MK_AIRBUS, "A318"},      {"A319", MK_AIRBUS, "A319"},
+  {"A320", MK_AIRBUS, "A320"},      {"A321", MK_AIRBUS, "A321"},
+  {"A19N", MK_AIRBUS, "A319NEO"},   {"A20N", MK_AIRBUS, "A320NEO"},
+  {"A21N", MK_AIRBUS, "A321NEO"},   {"A306", MK_AIRBUS, "A300-600"},
+  {"A310", MK_AIRBUS, "A310"},      {"A339", MK_AIRBUS, "A330NEO"},
+  {"A359", MK_AIRBUS, "A350-900"},  {"A35K", MK_AIRBUS, "A350-1000"},
+  {"A388", MK_AIRBUS, "A380"},      {"A124", MK_NONE,   "AN-124"},
+  {"BCS1", MK_AIRBUS, "A220-100"},  {"BCS3", MK_AIRBUS, "A220-300"},
+  // McDonnell Douglas
+  {"MD11", MK_MCDD,   "MD-11"},     {"MD82", MK_MCDD,   "MD-82"},
+  {"MD83", MK_MCDD,   "MD-83"},     {"MD88", MK_MCDD,   "MD-88"},
+  {"MD90", MK_MCDD,   "MD-90"},     {"DC10", MK_MCDD,   "DC-10"},
+  // Regional jets and turboprops
+  {"E135", MK_EMBRAER, "ERJ-135"},  {"E145", MK_EMBRAER, "ERJ-145"},
+  {"E45X", MK_EMBRAER, "ERJ-145XR"},{"E170", MK_EMBRAER, "E170"},
+  {"E75S", MK_EMBRAER, "E175"},     {"E75L", MK_EMBRAER, "E175"},
+  {"E190", MK_EMBRAER, "E190"},     {"E195", MK_EMBRAER, "E195"},
+  {"E290", MK_EMBRAER, "E190-E2"},  {"E295", MK_EMBRAER, "E195-E2"},
+  {"CRJ2", MK_BOMBARDIER, "CRJ-200"},{"CRJ7", MK_BOMBARDIER, "CRJ-700"},
+  {"CRJ9", MK_BOMBARDIER, "CRJ-900"},{"CRJX", MK_BOMBARDIER, "CRJ-1000"},
+  {"DH8A", MK_DHC,    "DASH 8"},    {"DH8B", MK_DHC,    "DASH 8"},
+  {"DH8C", MK_DHC,    "DASH 8"},    {"DH8D", MK_DHC,    "Q400"},
+  {"DHC6", MK_DHC,    "TWIN OTTR"}, {"AT43", MK_ATR,    "42"},
+  {"AT45", MK_ATR,    "42-500"},    {"AT72", MK_ATR,    "72"},
+  {"AT75", MK_ATR,    "72-500"},    {"AT76", MK_ATR,    "72-600"},
+  {"SF34", MK_SAAB,   "340"},       {"B190", MK_BEECH,  "1900"},
+  {"SW4 ", MK_NONE,   "METRO"},
+  // Business jets
+  {"GLF4", MK_GULFSTREAM, "G-IV"},  {"GLF5", MK_GULFSTREAM, "G550"},
+  {"GLF6", MK_GULFSTREAM, "G650"},  {"GA5C", MK_GULFSTREAM, "G500"},
+  {"GA6C", MK_GULFSTREAM, "G600"},  {"GA7C", MK_GULFSTREAM, "G700"},
+  {"G280", MK_GULFSTREAM, "G280"},  {"G150", MK_GULFSTREAM, "G150"},
+  {"GALX", MK_GULFSTREAM, "G200"},
+  {"CL30", MK_BOMBARDIER, "CL-300"},{"CL35", MK_BOMBARDIER, "CL-350"},
+  {"CL60", MK_BOMBARDIER, "CL-600"},{"GLEX", MK_BOMBARDIER, "GLOBAL"},
+  {"GL5T", MK_BOMBARDIER, "GLOBAL"}, {"GL7T", MK_BOMBARDIER, "GL-7500"},
+  {"FA7X", MK_DASSAULT, "FALCON 7X"},{"FA8X", MK_DASSAULT, "FALCON 8X"},
+  {"F2TH", MK_DASSAULT, "FALCON2K"},{"F900", MK_DASSAULT, "FALCON900"},
+  {"FA50", MK_DASSAULT, "FALCON 50"},{"FA6X", MK_DASSAULT, "FALCON 6X"},
+  {"LJ35", MK_LEARJET, "35"},       {"LJ45", MK_LEARJET, "45"},
+  {"LJ60", MK_LEARJET, "60"},       {"LJ75", MK_LEARJET, "75"},
+  {"C25A", MK_CESSNA, "CJ2"},       {"C25B", MK_CESSNA, "CJ3"},
+  {"C25C", MK_CESSNA, "CJ4"},       {"C25M", MK_CESSNA, "M2"},
+  {"C510", MK_CESSNA, "MUSTANG"},   {"C525", MK_CESSNA, "CJ1"},
+  {"C550", MK_CESSNA, "CIT II"}, {"C560", MK_CESSNA, "CIT V"},
+  {"C56X", MK_CESSNA, "CIT XLS"},{"C680", MK_CESSNA, "SOVEREIGN"},
+  {"C68A", MK_CESSNA, "LATITUDE"},  {"C700", MK_CESSNA, "LONGITUDE"},
+  {"C750", MK_CESSNA, "CIT X"},  {"E50P", MK_EMBRAER, "PHENOM100"},
+  {"E55P", MK_EMBRAER, "PHENOM300"},{"E545", MK_EMBRAER, "LEGACY450"},
+  {"E550", MK_EMBRAER, "LEGACY500"},{"E35L", MK_EMBRAER, "LEGACY650"},
+  {"HDJT", MK_HONDA,  "HONDAJET"},  {"PC24", MK_PILATUS, "PC-24"},
+  {"PRM1", MK_BEECH,  "PREMIER 1"}, {"BE40", MK_BEECH,  "BEECHJET"},
+  {"H25B", MK_NONE,   "HAWKER800"},{"HA4T", MK_NONE,   "HAWKER 4K"},
+  // General aviation
+  {"C150", MK_CESSNA, "150"},       {"C152", MK_CESSNA, "152"},
+  {"C172", MK_CESSNA, "172"},       {"C177", MK_CESSNA, "177"},
+  {"C182", MK_CESSNA, "182"},       {"C206", MK_CESSNA, "206"},
+  {"C208", MK_CESSNA, "CARAVAN"},   {"C210", MK_CESSNA, "210"},
+  {"C310", MK_CESSNA, "310"},       {"C340", MK_CESSNA, "340"},
+  {"C402", MK_CESSNA, "402"},       {"C414", MK_CESSNA, "414"},
+  {"C421", MK_CESSNA, "421"},       {"P28A", MK_PIPER,  "CHEROKEE"},
+  {"P28B", MK_PIPER,  "CHEROKEE"},  {"P28R", MK_PIPER,  "ARROW"},
+  {"PA28", MK_PIPER,  "CHEROKEE"},  {"PA31", MK_PIPER,  "NAVAJO"},
+  {"PA32", MK_PIPER,  "SARATOGA"},  {"PA34", MK_PIPER,  "SENECA"},
+  {"PA44", MK_PIPER,  "SEMINOLE"},  {"PA46", MK_PIPER,  "MALIBU"},
+  {"P46T", MK_PIPER,  "MERIDIAN"},  {"M600", MK_PIPER,  "M600"},
+  {"SR20", MK_CIRRUS, "SR20"},      {"SR22", MK_CIRRUS, "SR22"},
+  {"SF50", MK_CIRRUS, "VISIONJET"}, {"BE20", MK_BEECH,  "KING AIR"},
+  {"BE9L", MK_BEECH,  "KING AIR"},  {"B350", MK_BEECH,  "KING AIR"},
+  {"BE30", MK_BEECH,  "KING AIR"},  {"BE35", MK_BEECH,  "BONANZA"},
+  {"BE36", MK_BEECH,  "BONANZA"},   {"BE58", MK_BEECH,  "BARON"},
+  {"BE55", MK_BEECH,  "BARON"},     {"PC12", MK_PILATUS, "PC-12"},
+  {"TBM7", MK_DAHER,  "TBM 700"},   {"TBM8", MK_DAHER,  "TBM 850"},
+  {"TBM9", MK_DAHER,  "TBM 900"},   {"M20P", MK_MOONEY, "M20"},
+  {"M20T", MK_MOONEY, "M20"},       {"DA40", MK_DIAMOND, "DA40"},
+  {"DA42", MK_DIAMOND, "DA42"},     {"DA62", MK_DIAMOND, "DA62"},
+  {"RV10", MK_NONE,   "RV-10"},{"RV7 ", MK_NONE,   "RV-7"},
+  // Rotorcraft
+  {"H60 ", MK_SIKORSKY, "UH-60"},   {"S76 ", MK_SIKORSKY, "S-76"},
+  {"S92 ", MK_SIKORSKY, "S-92"},    {"S61 ", MK_SIKORSKY, "S-61"},
+  {"S70 ", MK_SIKORSKY, "S-70"},    {"H53 ", MK_SIKORSKY, "CH-53"},
+  {"EC20", MK_AIRBUS, "H120"},      {"EC30", MK_AIRBUS, "H130"},
+  {"EC35", MK_AIRBUS, "H135"},      {"EC45", MK_AIRBUS, "H145"},
+  {"EC55", MK_AIRBUS, "H155"},      {"EC75", MK_AIRBUS, "H175"},
+  {"AS50", MK_AIRBUS, "AS350"},     {"AS55", MK_AIRBUS, "AS355"},
+  {"AS65", MK_AIRBUS, "AS365"},     {"H72 ", MK_AIRBUS, "UH-72"},
+  {"B06T", MK_BELL,   "206L"},      {"B407", MK_BELL,   "407"},
+  {"B412", MK_BELL,   "412"},       {"B429", MK_BELL,   "429"},
+  {"B505", MK_BELL,   "505"},       {"B212", MK_BELL,   "212"},
+  {"UH1 ", MK_BELL,   "UH-1"}, {"B47G", MK_BELL,   "47"},
+  {"R22 ", MK_ROBINSON, "R22"},     {"R44 ", MK_ROBINSON, "R44"},
+  {"R66 ", MK_ROBINSON, "R66"},     {"A109", MK_LEONARDO, "AW109"},
+  {"A119", MK_LEONARDO, "AW119"},   {"A139", MK_LEONARDO, "AW139"},
+  {"A169", MK_LEONARDO, "AW169"},   {"A189", MK_LEONARDO, "AW189"},
+  {"MD52", MK_MDHELI, "MD 520"},    {"MD60", MK_MDHELI, "MD 600"},
+  {"H500", MK_MDHELI, "MD 500"},    {"EXPL", MK_MDHELI, "EXPLORER"},
+  {"H47 ", MK_BOEING, "CH-47"},     {"H64 ", MK_BOEING, "AH-64"},
+  {"V22 ", MK_BELL,   "V-22"},
+  // Military fixed-wing
+  {"C130", MK_LOCKHEED, "C-130"},   {"C30J", MK_LOCKHEED, "C-130J"},
+  {"C17 ", MK_BOEING, "C-17"},      {"C5M ", MK_LOCKHEED, "C-5M"},
+  {"C5  ", MK_LOCKHEED, "C-5"},     {"KC35", MK_BOEING, "KC-135"},
+  {"K35R", MK_BOEING, "KC-135R"},   {"KC46", MK_BOEING, "KC-46"},
+  {"KC10", MK_MCDD,   "KC-10"},     {"P8  ", MK_BOEING, "P-8"},
+  {"E3TF", MK_BOEING, "E-3 AWACS"}, {"E6  ", MK_BOEING, "E-6"},
+  {"C37 ", MK_GULFSTREAM, "C-37"},  {"C40 ", MK_BOEING, "C-40"},
+  {"C32 ", MK_BOEING, "C-32"},      {"F16 ", MK_LOCKHEED, "F-16"},
+  {"F35 ", MK_LOCKHEED, "F-35"},    {"F15 ", MK_BOEING, "F-15"},
+  {"F18 ", MK_BOEING, "F/A-18"},    {"F22 ", MK_LOCKHEED, "F-22"},
+  {"A10 ", MK_NONE,   "A-10"},      {"T38 ", MK_NORTHROP, "T-38"},
+  {"T6  ", MK_BEECH,  "T-6"},       {"B52 ", MK_BOEING, "B-52"},
+  {"C27J", MK_NONE,   "C-27J"},     {"E2  ", MK_NORTHROP, "E-2"},
+};
+
+static void makerName(uint8_t mk, char* out, size_t n) {
+  const char* p = MAKER_NAMES;
+  for (uint8_t i = 0; i < mk && i < MK_COUNT; i++) p += strlen_P(p) + 1;
+  strncpy_P(out, p, n - 1);
+  out[n - 1] = '\0';
+}
+
+// Spell out an ICAO type designator. full=true gives "MAKER MODEL" for the
+// TARGET row; full=false gives just the model for the radar's narrow panel.
+// Returns false, with the raw code copied to out, when nothing matched.
+bool airframeName(const char* code, char* out, size_t n, bool full) {
+  out[0] = '\0';
+  if (code == nullptr || code[0] == '\0') return false;
+
+  // Table entries are padded to four characters so a 3-letter code such as
+  // "H60" can share the fixed-width field; pad the query the same way.
+  char key[5];
+  snprintf(key, sizeof(key), "%-4.4s", code);
+
+  TypeNameRec rec;
+  for (size_t i = 0; i < sizeof(TYPE_NAMES) / sizeof(TYPE_NAMES[0]); i++) {
+    memcpy_P(&rec, &TYPE_NAMES[i], sizeof(rec));
+    if (strncasecmp(rec.code, key, 4) != 0) continue;
+    if (full && rec.maker != MK_NONE) {
+      char mk[12];
+      makerName(rec.maker, mk, sizeof(mk));
+      snprintf(out, n, "%s %s", mk, rec.model);
+    } else {
+      snprintf(out, n, "%s", rec.model);
+    }
+    return true;
+  }
+
+  // Family rules for the two big manufacturers. Boeing B7XY -> 7X7-Y00 (B738
+  // -> 737-800, B744 -> 747-400); Airbus A33Y / A34Y -> A330-Y00 / A340-Y00.
+  // Both are guarded to digit-only codes so nothing like B77W slips through
+  // as "777-W00" -- the irregulars are in the table above.
+  char c1 = toupper((unsigned char)code[0]);
+  if (strlen(code) == 4 && isdigit((unsigned char)code[2]) &&
+      isdigit((unsigned char)code[3])) {
+    if (c1 == 'B' && code[1] == '7') {
+      snprintf(out, n, "%s7%c7-%c00", full ? "BOEING " : "", code[2], code[3]);
+      return true;
+    }
+    if (c1 == 'A' && code[1] == '3' && (code[2] == '3' || code[2] == '4')) {
+      snprintf(out, n, "%sA3%c0-%c00", full ? "AIRBUS " : "", code[2], code[3]);
+      return true;
+    }
+  }
+
+  snprintf(out, n, "%s", code);
+  return false;
+}
+
 // Skull and crossbones, 16x14, for a military target. Takes the icon slot on
 // RADAR and TARGET in place of the airframe glyph; the type label and banner
 // still say what kind of airframe it is. XBM, LSB = leftmost pixel.
@@ -2260,10 +2483,24 @@ void screenNearest() {
   // aircraft-type icon, between the callsign and the heading arrow
   drawTargetIcon(82, 16);
 
-  u8g2.setFont(u8g2_font_6x12_tr);
+  // What it is, spelled out: "BOEING 777-300ER" rather than "B77W". This is
+  // the row guests actually read, so it sits directly under the callsign. An
+  // unresolved contact shows the kinematic guess with its '~' instead. 5x7
+  // keeps a 19-character name clear of the heading arrow at x=99.
   char line[24];
+  u8g2.setFont(u8g2_font_5x7_tr);
+  {
+    const char* typ = nearestType();
+    if (typ[0]) airframeName(typ, line, sizeof(line), true);
+    else        snprintf(line, sizeof(line), "%s%s",
+                         isEstimatedType(nearest) ? "~" : "", typeName(nearestCategory()));
+    for (char* c = line; *c; c++) *c = toupper((unsigned char)*c);
+    u8g2.drawStr(0, 32, line);
+  }
+
+  u8g2.setFont(u8g2_font_6x12_tr);
   snprintf(line, sizeof(line), "%.1f km %s", nearest.distanceKm, compass(nearest.bearingDeg));
-  u8g2.drawStr(0, 40, line);
+  u8g2.drawStr(0, 43, line);
 
   if (nearest.onGround) {
     u8g2.drawStr(0, 54, "on ground");
@@ -2472,11 +2709,13 @@ void screenRadar() {
   drawTargetIcon(px + 7, 18);
   u8g2.setFont(u8g2_font_5x7_tr);
   // A resolved type code is the most specific thing we know, so show it
-  // ("H60 HELI") rather than the class name it implies; unresolved contacts
-  // keep the guessed class with its '~'.
+  // spelled out as a model ("777-300ER", "UH-60") rather than the class name
+  // it implies; the icon beside it already says rotorcraft or not, and the
+  // panel is only 48 px wide here, so the maker is left to TARGET. Unresolved
+  // contacts keep the guessed class with its '~'.
   char tname[14];
   const char* typ = nearestType();
-  if (typ[0]) snprintf(tname, sizeof(tname), "%s%s", typ, isRotor(ec) ? " HELI" : "");
+  if (typ[0]) airframeName(typ, tname, sizeof(tname), false);
   else        snprintf(tname, sizeof(tname), "%s%s", isEstimatedType(nearest) ? "~" : "", typeName(ec));
   u8g2.drawStr(px + 18, 20, tname);
   // Military callsign is drawn inverted, the same treatment as the TARGET
@@ -2688,9 +2927,11 @@ void screenWeapons() {
   else       snprintf(line, sizeof(line), "TOF ---");
   u8g2.drawStr(C2, 54, line);
 
-  // Row 4: PK, labelled notional -- see calcPk() for why it must be.
-  if (pkOk) snprintf(line, sizeof(line), "PK %.2f NOTIONAL", pk);
-  else      snprintf(line, sizeof(line), "PK --- NOTIONAL");
+  // Row 4: PK. It is a heuristic (see calcPk()); the NOTIONAL suffix that
+  // used to say so was dropped as implied by the whole page. The caveat
+  // lives in the comments, not the pixels.
+  if (pkOk) snprintf(line, sizeof(line), "PK %.2f", pk);
+  else      snprintf(line, sizeof(line), "PK ---");
   u8g2.drawStr(0, 63, line);
 }
 
