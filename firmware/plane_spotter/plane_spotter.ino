@@ -1692,12 +1692,12 @@ static const char WS_B_NAM[] PROGMEM = "AVENGER";
 static const char WS_B_BRN[] PROGMEM = "US ARMY";
 static const char WS_B_ROL[] PROGMEM = "SHORT RANGE";
 static const char WS_C_DES[] PROGMEM = "M-SHORAD";
-static const char WS_C_NAM[] PROGMEM = "STRYKER SHORAD";
+static const char WS_C_NAM[] PROGMEM = "STRYKER";
 static const char WS_C_BRN[] PROGMEM = "US ARMY";
 static const char WS_C_ROL[] PROGMEM = "POINT DEFENSE";
 static const char WS_D_DES[] PROGMEM = "NASAMS";
 static const char WS_D_NAM[] PROGMEM = "NASAMS";
-static const char WS_D_BRN[] PROGMEM = "US / NORWAY";
+static const char WS_D_BRN[] PROGMEM = "US/NORWAY";
 static const char WS_D_ROL[] PROGMEM = "AREA DEFENSE";
 static const char WS_E_DES[] PROGMEM = "SM-2";
 static const char WS_E_NAM[] PROGMEM = "AEGIS";
@@ -1705,7 +1705,7 @@ static const char WS_E_BRN[] PROGMEM = "US NAVY";
 static const char WS_E_ROL[] PROGMEM = "FLEET DEFENSE";
 static const char WS_F_DES[] PROGMEM = "MADIS";
 static const char WS_F_NAM[] PROGMEM = "MADIS";
-static const char WS_F_BRN[] PROGMEM = "USMC EXPD";
+static const char WS_F_BRN[] PROGMEM = "USMC";
 static const char WS_F_ROL[] PROGMEM = "POINT DEFENSE";
 
 // Index constants keep selectWeaponSystem() readable.
@@ -1882,6 +1882,24 @@ uint8_t selectWeaponSystem(AirframeClass airframe, AltitudeBand band, double dis
 #endif
 }
 
+// ORGANIC if the matched system belongs to the theme's own branch, JOINT if
+// the ladder stepped outside it. The themes are ladders, not arsenals: the
+// Marine theme owns only MADIS and hands off to NASAMS and Patriot above it,
+// because the Marines field no organic medium or long-range SAM. Rather than
+// blank the page for most traffic, the hand-off is labelled -- which is also
+// how an expeditionary site is actually defended, by joint assets layered over
+// its own SHORAD.
+const char* branchTag(const char* branch) {
+#if DEFENSE_THEME == DEFENSE_THEME_NAVY
+  const char* own = "US NAVY";
+#elif DEFENSE_THEME == DEFENSE_THEME_MARINE
+  const char* own = "USMC";
+#else
+  const char* own = "US ARMY";
+#endif
+  return strncmp(branch, own, strlen(own)) == 0 ? "ORGANIC" : "JOINT";
+}
+
 // Is the contact inside the selected system's published envelope? Range and
 // ceiling only -- the honest limit of what open figures support.
 Envelope classifyEnvelope(const WeaponSystemRecord& w, double distanceKm,
@@ -1965,6 +1983,25 @@ const char* threatText(ThreatLevel t) {
     case ThreatLevel::HIGH_THREAT:    return "HIGH";
     case ThreatLevel::EXTREME_THREAT: return "EXTREME";
     default:                          return "UNKNOWN";
+  }
+}
+
+// Half-row forms for the WEAPONS table, where a column is 13 characters.
+const char* airframeShort(AirframeClass a) {
+  switch (a) {
+    case AirframeClass::FIXED_WING: return "FIXED";
+    case AirframeClass::HELICOPTER: return "HELI";
+    case AirframeClass::UAV:        return "UAV";
+    default:                        return "---";
+  }
+}
+const char* envelopeShort(Envelope e) {
+  switch (e) {
+    case Envelope::INSIDE:    return "IN";
+    case Envelope::TOO_FAR:   return "FAR";
+    case Envelope::TOO_CLOSE: return "MIN";
+    case Envelope::ALT_OUT:   return "ALT";
+    default:                  return "---";
   }
 }
 
@@ -2552,8 +2589,10 @@ void screenSystem() {
   u8g2.drawStr(18, 62, l);
 }
 
-// WEAPONS SYSTEM. One static page, no animation. Everything is drawn in the
-// 4x6 font (32 chars across) so nine rows fit under the header without wrap.
+// WEAPONS SYSTEM. One static page of data, laid out as a table in 5x7 so it
+// reads at a glance: system block on top, then three rows of label/value
+// pairs in two columns. It went through a chart-plus-sidebar version and came
+// back -- the graphic was fighting the text for a 128x64 panel and losing.
 void screenWeapons() {
   drawHeader("WEAPONS");
 
@@ -2589,61 +2628,69 @@ void screenWeapons() {
   bool  tofOk = calcInterceptSeconds(w, nearest.distanceKm, env, tof);
   bool  pkOk  = calcPk(w, nearest.distanceKm, altFt, haveAlt, threat, env, pk);
 
-  char line[36], des[12], nam[16], brn[14], rol[16], sol[10];
+  char line[28], des[12], nam[16], brn[14], rol[16], sol[10];
   copyPgm(des, sizeof(des), w.designation);
   copyPgm(nam, sizeof(nam), w.name);
   copyPgm(brn, sizeof(brn), w.branch);
   copyPgm(rol, sizeof(rol), w.role);
   formatSolution(sol, sizeof(sol), solOk, solDeg);
 
-  u8g2.setFont(u8g2_font_4x6_tr);
+  u8g2.setFont(u8g2_font_5x7_tr);
+  const int C2 = 68;                       // second column
 
-  const char* acType = fresh ? acTypeFor(nearest.icao24) : "";
-  if (acType[0]) snprintf(line, sizeof(line), "AIRFRAME: %s %s", airframeText(af), acType);
-  else           snprintf(line, sizeof(line), "AIRFRAME: %s", airframeText(af));
-  u8g2.drawStr(0, 15, line);
-  snprintf(line, sizeof(line), "ALT BAND: %s", altBandText(band));
-  u8g2.drawStr(0, 21, line);
-
-  // Firing authorization used to sit on this row as AUTH:HOLD. It is
-  // unconditional -- every contact is friendly and nothing is armed -- so it
-  // said the same thing on every frame and was dropped as noise. The policy
-  // has not changed, only the label.
-  snprintf(line, sizeof(line), "THREAT: %s", threatText(threat));
-  if (threat == ThreatLevel::EXTREME_THREAT) {      // inverted, like the banners
-    u8g2.drawBox(0, 21, strlen(line) * 4 + 3, 8);
+  // System block, two rows: "DES NAME" with the ORGANIC / JOINT tag inverted
+  // at the right, then "ROLE . BRANCH". Designation is skipped when it is the
+  // same word as the name (NASAMS, MADIS).
+  if (strcmp(des, nam) == 0) snprintf(line, sizeof(line), "%s", nam);
+  else                       snprintf(line, sizeof(line), "%s %s", des, nam);
+  u8g2.drawStr(0, 16, line);
+  {
+    const char* tag = branchTag(brn);
+    int tw = strlen(tag) * 5 + 3;
+    u8g2.drawBox(128 - tw, 9, tw, 9);
     u8g2.setDrawColor(0);
-    u8g2.drawStr(2, 27, line);
+    u8g2.drawStr(128 - tw + 2, 16, tag);
+    u8g2.setDrawColor(1);
+  }
+  snprintf(line, sizeof(line), "%s . %s", rol, brn);
+  u8g2.drawStr(0, 24, line);
+  u8g2.drawHLine(0, 27, 128);
+
+  // Four rows of label/value pairs, 9 px pitch.
+  // Row 1: target | altitude band
+  const char* typ = fresh ? nearestType() : "";
+  if (!fresh)      snprintf(line, sizeof(line), "TGT ---");
+  else if (typ[0]) snprintf(line, sizeof(line), "TGT %s%s", typ, isRotor(cat) ? " HELI" : "");
+  else             snprintf(line, sizeof(line), "TGT %s", airframeShort(af));
+  u8g2.drawStr(0, 36, line);
+  snprintf(line, sizeof(line), "ALT %s", altBandText(band));
+  u8g2.drawStr(C2, 36, line);
+
+  // Row 2: threat (inverted when EXTREME, like the banners) | solution
+  snprintf(line, sizeof(line), "THR %s", threatText(threat));
+  if (threat == ThreatLevel::EXTREME_THREAT) {
+    u8g2.drawBox(-1, 38, strlen(line) * 5 + 3, 9);
+    u8g2.setDrawColor(0);
+    u8g2.drawStr(1, 45, line);
     u8g2.setDrawColor(1);
   } else {
-    u8g2.drawStr(0, 27, line);
+    u8g2.drawStr(0, 45, line);
   }
+  snprintf(line, sizeof(line), "SOL %s", sol);
+  u8g2.drawStr(C2, 45, line);
 
-  snprintf(line, sizeof(line), "SOLUTION: %s", sol);
-  u8g2.drawStr(0, 33, line);
+  // Row 3: envelope with range over max range | time of flight
+  if (fresh) snprintf(line, sizeof(line), "ENV %s %d/%d", envelopeShort(env),
+                      (int)(nearest.distanceKm + 0.5), w.maxRangeKm);
+  else       snprintf(line, sizeof(line), "ENV --- -/%d", w.maxRangeKm);
+  u8g2.drawStr(0, 54, line);
+  if (tofOk) snprintf(line, sizeof(line), "TOF %ds", (int)(tof + 0.5f));
+  else       snprintf(line, sizeof(line), "TOF ---");
+  u8g2.drawStr(C2, 54, line);
 
-  if (fresh)
-    snprintf(line, sizeof(line), "ENV %s  RNG %03d/%03dKM",
-             envelopeText(env), (int)(nearest.distanceKm + 0.5), w.maxRangeKm);
-  else
-    snprintf(line, sizeof(line), "ENV ---  RNG ---/%03dKM", w.maxRangeKm);
-  u8g2.drawStr(0, 39, line);
-
-  if (tofOk && pkOk)
-    snprintf(line, sizeof(line), "TOF %03ds  PK %.2f NOTNL", (int)(tof + 0.5f), pk);
-  else if (tofOk)
-    snprintf(line, sizeof(line), "TOF %03ds  PK ---", (int)(tof + 0.5f));
-  else
-    snprintf(line, sizeof(line), "TOF ---   PK ---");
-  u8g2.drawStr(0, 45, line);
-
-  u8g2.drawHLine(0, 48, 128);
-
-  snprintf(line, sizeof(line), "MATCH: %s", des);
-  u8g2.drawStr(0, 57, line);
-  u8g2.drawStr(128 - u8g2.getStrWidth(rol), 57, rol);
-
-  snprintf(line, sizeof(line), "%s / %s", nam, brn);
+  // Row 4: PK, labelled notional -- see calcPk() for why it must be.
+  if (pkOk) snprintf(line, sizeof(line), "PK %.2f NOTIONAL", pk);
+  else      snprintf(line, sizeof(line), "PK --- NOTIONAL");
   u8g2.drawStr(0, 63, line);
 }
 

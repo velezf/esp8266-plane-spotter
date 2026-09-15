@@ -489,7 +489,27 @@ time-of-flight use published reference figures; **PK is an invented geometric
 heuristic** labelled `NOTNL`, because no public data supports a real one. No
 no-escape-zone or doctrinal engagement data is represented, for the same reason.
 `SOLUTION` is a bearing delta over `TRACK_LOOKAHEAD_SECONDS`, not a firing
-solution.
+solution. It was dropped once for space and put back because it is the
+thematic touch; it lives in the sidebar.
+
+**Layout is a table, 5x7, no graphics.** Two system rows (designation and
+name with the tag; role and branch), a rule, then four rows of label/value
+pairs in two columns (second column at x=68): TGT | ALT, THR | SOL,
+ENV | TOF, PK NOTIONAL. Same content as the original nine-row 4x6 page,
+nothing dropped. It went through a
+range-versus-altitude envelope chart with a 4x6 sidebar and came straight
+back: on a 128x64 panel the graphic fought the text and the owner wanted
+something readable from across the room, not a plot. Do not reintroduce
+graphics here. Half-row values use the short forms (`airframeShort()`,
+`envelopeShort()`): a column is 13 characters of 5x7.
+
+**Themes are ladders, not arsenals.** The Marine theme owns only MADIS and
+hands off to NASAMS and Patriot above it, because the Marines field no organic
+medium or long-range SAM; a strict filter would blank the page for most
+traffic. `branchTag()` labels the hand-off instead: **ORGANIC** when the
+matched system's branch is the theme's, **JOINT** otherwise. The tag is a
+prefix match on the record's `branch` string, so keep those strings starting
+with the service name.
 
 Two traps live here. **`LOW` and `HIGH` are Arduino macros** — the preprocessor
 rewrites them even inside an `enum class`, so `AltitudeBand::LOW` silently
@@ -498,8 +518,11 @@ reason alone. And the Arduino builder emits prototypes *above* the sketch body,
 so any type used in a signature must be declared near the top of the file, which
 is why the enums and `WeaponSystemRecord` sit up with the data model.
 
-Rows are 4x6 (32 columns). When editing the layout, regenerate the line-width
-audit rather than eyeballing it — the longest current line is 30 columns.
+Rows are 5x7 (25 columns full width, 13 per column). When editing them,
+regenerate the line-width audit rather than eyeballing it — the role/branch
+row is the longest at 24 (`AREA DEFENSE . US/NORWAY`), which is why
+`WS_D_BRN` is `US/NORWAY`, `WS_F_BRN` is `USMC` and `WS_C_NAM` is `STRYKER`
+(the name row has to leave 38 px for the `ORGANIC` tag).
 
 ### Type icons
 
