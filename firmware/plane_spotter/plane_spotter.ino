@@ -48,6 +48,20 @@
 #ifndef TARGET_PRIORITY_RANGE_KM
 #define TARGET_PRIORITY_RANGE_KM  17.0
 #endif
+// Formation detection thresholds; documented in config.h, defaulted here so
+// a config written before they existed still builds.
+#ifndef FORMATION_SEP_KM
+#define FORMATION_SEP_KM        2.0
+#endif
+#ifndef FORMATION_DV_KMH
+#define FORMATION_DV_KMH        40.0
+#endif
+#ifndef FORMATION_MIN_POLLS
+#define FORMATION_MIN_POLLS     2
+#endif
+#ifndef FORMATION_LEAD_HYST_KM
+#define FORMATION_LEAD_HYST_KM  0.5
+#endif
 
 // ---------------------------------------------------------------------------
 // Display: SSD1306 128x64. Two builds selectable with DISPLAY_I2C:
@@ -165,7 +179,7 @@ Aircraft nearest;
 // a signature must already be a complete type by then.
 enum class AirframeClass : uint8_t { FIXED_WING, HELICOPTER, UAV, UNKNOWN };
 enum class AltitudeBand  : uint8_t { VERY_LOW, LOW_ALT, MEDIUM, MED_HIGH, HIGH_ALT, UNKNOWN };
-enum class ThreatLevel   : uint8_t { LOW_THREAT, MED_THREAT, HIGH_THREAT, EXTREME_THREAT, UNKNOWN };
+enum class ThreatLevel   : uint8_t { LOW_THREAT, MED_THREAT, HIGH_THREAT, EXTREME_THREAT, IMMINENT_THREAT, UNKNOWN };
 enum class Envelope      : uint8_t { INSIDE, TOO_FAR, TOO_CLOSE, ALT_OUT, NO_DATA };
 
 // Approximate *published* reference figures. These are open-source
@@ -211,6 +225,12 @@ struct Blip {
   uint8_t cat;      // effective emitter category (8 = rotorcraft)
   bool    loiter;   // rotorcraft that has held station (see HeliTrack)
   bool    mil;      // icao24 in a military block, or a military type code
+  uint8_t form;     // latched formation size this blip belongs to, 0 if none
+  // The address, so detectFormations() can find this contact's persistent
+  // entry in helis[] / milSeen[] after the parse loop. It is not identity that
+  // survives a poll -- blips[] is still rebuilt from scratch -- just a key
+  // valid until the next fetch. 7 bytes x MAX_BLIPS.
+  char    icao24[7];
 };
 const uint8_t MAX_BLIPS = 20;
 Blip     blips[MAX_BLIPS];
@@ -241,8 +261,16 @@ struct HeliTrack {
   // close enough, whenever that is.
   bool     acquireAlerted; // acquisition voice has sounded for this airframe
   bool     loiterAlerted;  // loiter voice has sounded for this anchor
+  // Formation state, maintained by detectFormations() -- see that function.
+  uint8_t  formN;          // cluster size on the last poll, 0 when alone
+  uint8_t  formPolls;      // consecutive polls clustered; latches at FORMATION_MIN_POLLS
+  bool     formAlerted;    // formation voice has sounded for this run of membership
 };
-const uint8_t MAX_HELI = 4;
+// Sized like MAX_MIL, for a formation rather than the typical case: a
+// three-ship arriving while a couple of singles are already around would
+// otherwise evict a member every poll, and an evicted member re-enters with
+// its formation count at zero and re-alerts once it re-latches.
+const uint8_t MAX_HELI = 8;
 HeliTrack helis[MAX_HELI];
 uint8_t   heliCount = 0;
 
@@ -779,6 +807,9 @@ bool trackRotorcraft(const char* icao, double lat, double lon, double distanceKm
   helis[slot].loitering      = false;
   helis[slot].acquireAlerted = inRange;
   helis[slot].loiterAlerted  = false;
+  helis[slot].formN          = 0;
+  helis[slot].formPolls      = 0;
+  helis[slot].formAlerted    = false;
   Serial.printf("[heli] new contact %s\n", icao);
   if (inRange) buzzerAcquire();
   return false;
@@ -794,6 +825,9 @@ struct MilTrack {
   uint32_t lastSeenMs;
   bool     alerted;     // the voice has sounded -- separate from "seen" for the
                         // reason given at HeliTrack
+  uint8_t  formN;       // formation state, as in HeliTrack
+  uint8_t  formPolls;
+  bool     formAlerted;
 };
 MilTrack milSeen[MAX_MIL];
 uint8_t  milCount = 0;
@@ -832,6 +866,9 @@ bool trackMilitary(const char* icao, double distanceKm, bool& alert) {
   milSeen[slot].icao24[sizeof(milSeen[0].icao24) - 1] = '\0';
   milSeen[slot].lastSeenMs = now;
   milSeen[slot].alerted    = inRange;
+  milSeen[slot].formN      = 0;
+  milSeen[slot].formPolls  = 0;
+  milSeen[slot].formAlerted = false;
   alert = inRange;
   return true;
 }
@@ -848,6 +885,136 @@ void expireMilitary() {
     }
   }
   milCount = w;
+}
+
+// ---------------------------------------------------------------------------
+// Formations
+// ---------------------------------------------------------------------------
+// Two or more special contacts -- rotorcraft or military -- moving together.
+// That is what "worth running outside for" looks like in the data, and it is
+// the one thing the per-airframe trackers above cannot see, since each of
+// them looks at one contact at a time.
+//
+// Detection runs over blips[] once per poll, after the parse, because that is
+// where every contact's flat position and velocity already sit: separation is
+// one distance per pair, and "moving together" is the magnitude of the
+// velocity difference, which tests track and speed in one number with no
+// angle wrap. A crossing pair is close but diverging and fails the second
+// test. Only rotorcraft and military blips are candidates, so it is a handful
+// of pairs, not MAX_BLIPS squared.
+//
+// Persistence lives in helis[] / milSeen[], keyed by icao24 like everything
+// else that has to survive a poll: formPolls counts consecutive polls the
+// airframe was clustered with something and latches at FORMATION_MIN_POLLS.
+// Breaking formation resets the count and the alert flag, so a flight that
+// splits and re-forms alerts again -- the same rule as the loiter anchor. A
+// military rotorcraft is in both tables and both are updated, so either
+// lookup agrees.
+//
+// A contact with unknown speed or track has vx = vy = 0 and is not a
+// candidate: two such contacts would "agree" perfectly, and inferring from
+// missing data is the mistake the NAN work exists to prevent. That also
+// excludes a hovering pair, which is accepted.
+//
+// The count is a lower bound. Military flights routinely have one ship on
+// ADS-B and the rest dark, so a single contact may still be a three-ship.
+// Nothing this module can see fixes that; it is a job for a future project
+// that can detect non-ADS-B traffic.
+
+bool formationCandidate(const Blip& b) {
+  return (isRotor(b.cat) || b.mil) && (b.vx != 0.0f || b.vy != 0.0f);
+}
+
+// Fold this poll's cluster size into one table entry. Returns true when the
+// formation is latched after the update; sets `alert` on the poll the voice
+// should sound -- latched, inside BUZZER_RANGE_KM, not yet announced.
+static bool formationFold(uint8_t& formN, uint8_t& formPolls, bool& formAlerted,
+                          uint8_t size, bool inRange, bool& alert) {
+  if (size < 2) {
+    formN = 0; formPolls = 0; formAlerted = false;
+    return false;
+  }
+  formN = size;
+  if (formPolls < 255) formPolls++;
+  bool latched = formPolls >= FORMATION_MIN_POLLS;
+  if (latched && inRange && !formAlerted) { formAlerted = true; alert = true; }
+  return latched;
+}
+
+bool formationUpdate(const char* icao, uint8_t size, bool inRange, bool& alert) {
+  bool latched = false;
+  alert = false;
+  for (uint8_t i = 0; i < heliCount; i++)
+    if (strcmp(helis[i].icao24, icao) == 0)
+      latched |= formationFold(helis[i].formN, helis[i].formPolls,
+                               helis[i].formAlerted, size, inRange, alert);
+  for (uint8_t i = 0; i < milCount; i++)
+    if (strcmp(milSeen[i].icao24, icao) == 0)
+      latched |= formationFold(milSeen[i].formN, milSeen[i].formPolls,
+                               milSeen[i].formAlerted, size, inRange, alert);
+  return latched;
+}
+
+// Latched formation size for an airframe, 0 when it is not in one. Reads the
+// tables, so during the parse loop it answers for the *previous* poll -- the
+// same one-poll lag the target tier already has for resolved type codes.
+uint8_t formationSizeFor(const char* icao) {
+  if (icao == nullptr || icao[0] == '\0') return 0;
+  for (uint8_t i = 0; i < heliCount; i++)
+    if (strcmp(helis[i].icao24, icao) == 0)
+      return helis[i].formPolls >= FORMATION_MIN_POLLS ? helis[i].formN : 0;
+  for (uint8_t i = 0; i < milCount; i++)
+    if (strcmp(milSeen[i].icao24, icao) == 0)
+      return milSeen[i].formPolls >= FORMATION_MIN_POLLS ? milSeen[i].formN : 0;
+  return 0;
+}
+
+// Cluster this poll's special contacts and fold the result into the tables.
+// Called once per fetch, after the parse loop has built blips[] and run the
+// per-airframe trackers (so every candidate has an entry to persist in) and
+// before the expiry passes. Returns the number of latched members.
+uint8_t detectFormations() {
+  uint8_t parent[MAX_BLIPS];
+  for (uint8_t i = 0; i < blipCount; i++) parent[i] = i;
+  auto root = [&](uint8_t i) { while (parent[i] != i) i = parent[i]; return i; };
+
+  const float sepMax2 = (float)(FORMATION_SEP_KM * FORMATION_SEP_KM);
+  const float dvMax   = (float)(FORMATION_DV_KMH / 3600.0);   // km/s, like vx/vy
+  const float dvMax2  = dvMax * dvMax;
+  for (uint8_t i = 0; i < blipCount; i++) {
+    if (!formationCandidate(blips[i])) continue;
+    for (uint8_t j = i + 1; j < blipCount; j++) {
+      if (!formationCandidate(blips[j])) continue;
+      float dx = blips[i].x - blips[j].x, dy = blips[i].y - blips[j].y;
+      if (dx * dx + dy * dy > sepMax2) continue;
+      float dvx = blips[i].vx - blips[j].vx, dvy = blips[i].vy - blips[j].vy;
+      if (dvx * dvx + dvy * dvy > dvMax2) continue;
+      uint8_t a = root(i), b = root(j);
+      if (a != b) parent[a] = b;
+    }
+  }
+
+  uint8_t size[MAX_BLIPS];
+  memset(size, 0, sizeof(size));
+  for (uint8_t i = 0; i < blipCount; i++)
+    if (formationCandidate(blips[i])) size[root(i)]++;
+
+  uint8_t members = 0;
+  for (uint8_t i = 0; i < blipCount; i++) {
+    blips[i].form = 0;
+    if (!formationCandidate(blips[i])) continue;
+    uint8_t n    = size[root(i)];
+    float   dist = sqrtf(blips[i].x * blips[i].x + blips[i].y * blips[i].y);
+    bool    alert;
+    bool    latched = formationUpdate(blips[i].icao24, n, dist <= BUZZER_RANGE_KM, alert);
+    if (latched) { blips[i].form = n; members++; }
+    if (alert) {
+      Serial.printf("[form] %s in a %u-ship at %.1f km\n", blips[i].icao24, n, dist);
+      buzzerFormation();   // three members latching together collapse to one
+                           // voice: equal priority is first-come in buzzerChirp
+    }
+  }
+  return members;
 }
 
 // Drop an airframe from the loiter table because identity has since proved it
@@ -1088,6 +1255,7 @@ bool fetchAircraft() {
   best.valid      = false;
   best.distanceKm = 1e9;
   uint8_t  bestPrio  = 0;
+  float    bestScore = -1e30f;   // within a tier: -range, or lead position for a formation
   double   minD      = 1e9;   // true closest, for the SYSTEM statistic
   uint16_t count     = 0;
   uint8_t  rotorSeen = 0;
@@ -1171,27 +1339,36 @@ bool fetchAircraft() {
       loiter = trackRotorcraft(hexId, lat, lon, d);
     }
 
+    // Flat east/north km from the range and bearing already in hand, with the
+    // velocity resolved onto the same axes so the radar dead-reckons with one
+    // multiply per axis. Unknown speed or track means the blip holds still,
+    // which is honest -- guessing a heading would creep it wrongly. Computed
+    // for every contact, not just the ones that fit a blip, because the
+    // formation lead test below wants the same frame.
+    float fx, fy, fvx = 0.0f, fvy = 0.0f;
+    {
+      double brgRad = deg2rad(brg);
+      fx = (float)(d * sin(brgRad));
+      fy = (float)(d * cos(brgRad));
+      if (!onGround && isfinite(velMs) && isfinite(trackDeg) && velMs > 0.0f) {
+        double trkRad = deg2rad(trackDeg);
+        fvx = (float)(velMs * sin(trkRad) / 1000.0);
+        fvy = (float)(velMs * cos(trkRad) / 1000.0);
+      }
+    }
+
     int8_t thisBlip = -1;
     if (blipCount < MAX_BLIPS) {
       thisBlip = (int8_t)blipCount;
-      // Flat east/north km from the range and bearing already in hand, with
-      // the velocity resolved onto the same axes so the radar dead-reckons with
-      // one multiply per axis. Unknown speed or track means the blip holds
-      // still, which is honest -- guessing a heading would creep it wrongly.
       Blip& b = blips[blipCount++];
-      double brgRad = deg2rad(brg);
-      b.x = (float)(d * sin(brgRad));
-      b.y = (float)(d * cos(brgRad));
-      if (!onGround && isfinite(velMs) && isfinite(trackDeg) && velMs > 0.0f) {
-        double trkRad = deg2rad(trackDeg);
-        b.vx = (float)(velMs * sin(trkRad) / 1000.0);
-        b.vy = (float)(velMs * cos(trkRad) / 1000.0);
-      } else {
-        b.vx = b.vy = 0.0f;
-      }
+      b.x  = fx;  b.y  = fy;
+      b.vx = fvx; b.vy = fvy;
       b.cat    = (uint8_t)cat;
       b.loiter = loiter;
       b.mil    = mil;
+      b.form   = 0;                          // detectFormations() fills this in
+      strncpy(b.icao24, hexId, sizeof(b.icao24) - 1);
+      b.icao24[sizeof(b.icao24) - 1] = '\0';
     }
 
     // Target selection: priority tier first, then range within the tier. A
@@ -1204,10 +1381,28 @@ bool fetchAircraft() {
     // the pages from 25 km out over airliners passing overhead. Note the tier
     // uses `cat` as resolved *this* poll, so a fast rotorcraft only outranks
     // once its type code has come back (one poll after it is first queued).
-    uint8_t prio = isRotor(cat) ? (loiter ? 3 : 2) : (mil ? 1 : 0);
+    //
+    // A latched formation sits above all of that, and within it the *lead*
+    // wins rather than the closest member: the pages should stay with the
+    // aircraft at the front of the flight, not hop between wingmen as the
+    // geometry shifts. Lead is the member furthest along the shared direction
+    // of travel -- the projection of position onto the velocity -- and the
+    // incumbent target gets a small bonus so two ships flying abreast do not
+    // trade the pages every poll. Membership is read from the tables, so it
+    // is as of the previous poll, like the type code.
+    uint8_t prio  = isRotor(cat) ? (loiter ? 3 : 2) : (mil ? 1 : 0);
+    uint8_t formN = formationSizeFor(hexId);
+    if (formN >= 2) prio += 4;
     if (d > TARGET_PRIORITY_RANGE_KM) prio = 0;
-    if (prio > bestPrio || (prio == bestPrio && d < best.distanceKm)) {
+    float score = -(float)d;
+    if (prio >= 4) {
+      float spd = sqrtf(fvx * fvx + fvy * fvy);
+      if (spd > 0.0f) score = (fx * fvx + fy * fvy) / spd;
+      if (nearest.valid && strcmp(hexId, nearest.icao24) == 0) score += FORMATION_LEAD_HYST_KM;
+    }
+    if (prio > bestPrio || (prio == bestPrio && score > bestScore)) {
       bestPrio        = prio;
+      bestScore       = score;
       targetBlip      = thisBlip;
       best.distanceKm = d;
       best.lat        = lat;
@@ -1240,6 +1435,9 @@ bool fetchAircraft() {
     }
   }
 
+  // Formations need every blip in hand, so this runs after the loop; it also
+  // needs every candidate's table entry, so it runs before the expiry passes.
+  uint8_t formSeen = detectFormations();
   expireRotorcraft();
   expireMilitary();
 
@@ -1254,8 +1452,8 @@ bool fetchAircraft() {
   if (!nearest.valid) targetBlip = -1;
   if (count > 0 && minD < stats.closestEver) stats.closestEver = minD;
 
-  Serial.printf("[fetch] inView=%u blips=%u rotor=%u target=%s prio=%u cat=%d dist=%.1fkm valid=%d heap=%u\n",
-                count, blipCount, rotorSeen, nearest.valid ? nearest.callsign : "-",
+  Serial.printf("[fetch] inView=%u blips=%u rotor=%u form=%u target=%s prio=%u cat=%d dist=%.1fkm valid=%d heap=%u\n",
+                count, blipCount, rotorSeen, formSeen, nearest.valid ? nearest.callsign : "-",
                 bestPrio, nearest.valid ? nearest.category : -1,
                 nearest.valid ? nearest.distanceKm : 0.0, nearest.valid,
                 ESP.getFreeHeap());
@@ -1614,15 +1812,20 @@ void buzzerPause() {
   chirpNextMs = millis() + chirpGapMs;
 }
 
-// Four voices, deliberately separated on both axes the element can express --
+// Five voices, deliberately separated on both axes the element can express --
 // pitch and rhythm -- because on a single piezo that is all there is to work
 // with. Read down the list: pitch falls as the pulses get longer and fewer.
 // Military is the odd one out at the top: fastest and highest, a trill rather
 // than a beat, so it does not read as "more of the rotorcraft alert".
-// All four stay inside the 2-5 kHz band these elements actually project.
+// Formation slots between the trill and the two-tone in pitch and pulse
+// length, and is the longest run by far -- six pulses -- because it is the
+// rarest event and the one worth leaving the room for. It is also the only
+// alert at priority 2, so it cuts any other alert that happens to be
+// sounding. All five stay inside the 2-5 kHz band these elements project.
 // First argument is priority: the tick yields to any alert (see buzzerChirp).
 void buzzerSweepBlip()  { buzzerChirp(0, 1, 4000,  25,  40); }  // crisp tick
 void buzzerMilitary()   { buzzerChirp(1, 4, 4500,  40,  45); }  // fast high trill
+void buzzerFormation()  { buzzerChirp(2, 6, 3500,  50,  50); }  // long mid run
 void buzzerAcquire()    { buzzerChirp(1, 2, 3000,  60,  70); }  // two-tone
 void buzzerLoiter()     { buzzerChirp(1, 3, 2200, 120, 100); }  // lowest, insistent
 
@@ -1633,6 +1836,7 @@ inline void buzzerService()  {}
 inline void buzzerPause()    {}
 inline void buzzerSweepBlip(){}
 inline void buzzerMilitary() {}
+inline void buzzerFormation(){}
 inline void buzzerAcquire()  {}
 inline void buzzerLoiter()   {}
 #endif
@@ -1809,17 +2013,21 @@ AirframeClass classifyAirframe(int category) {
   }
 }
 
-// "Threat" is identity first, geometry second. A rotorcraft is EXTREME
-// wherever it is and whatever it is doing -- around here that is the contact
-// the whole device exists for, and scoring it LOW because it happened to be
-// tracking away was absurd. A military fixed-wing floors at HIGH. Everything
-// else is aspect (how directly the contact is tracking over the device)
-// tightened by slant range. Everything is friendly regardless -- this drives
-// nothing but the label and the notional PK.
+// "Threat" is identity first, geometry second. A formation member is IMMINENT
+// whatever it is -- several special contacts moving together is the top of
+// the scale by definition. Below that a rotorcraft is EXTREME wherever it is
+// and whatever it is doing -- around here that is the contact the whole
+// device exists for, and scoring it LOW because it happened to be tracking
+// away was absurd. A military fixed-wing floors at HIGH. Everything else is
+// aspect (how directly the contact is tracking over the device) tightened by
+// slant range. Everything is friendly regardless -- this drives nothing but
+// the label and the notional PK.
 ThreatLevel classifyThreat(double bearingFromDevice, float trackDeg,
                            double distanceKm, float altitudeFt, bool haveAlt,
-                           bool valid, AirframeClass airframe, bool military) {
+                           bool valid, AirframeClass airframe, bool military,
+                           bool formation) {
   if (!valid) return ThreatLevel::UNKNOWN;
+  if (formation) return ThreatLevel::IMMINENT_THREAT;
   if (airframe == AirframeClass::HELICOPTER) return ThreatLevel::EXTREME_THREAT;
 
   ThreatLevel geo = classifyThreatGeometry(bearingFromDevice, trackDeg,
@@ -1945,7 +2153,8 @@ bool calcPk(const WeaponSystemRecord& w, double distanceKm, float altitudeFt,
     if (ceilFt > 0.0f) altFit = 1.0f - 0.5f * (altitudeFt / ceilFt);
   }
 
-  float aspectFit = (threat == ThreatLevel::EXTREME_THREAT ||
+  float aspectFit = (threat == ThreatLevel::IMMINENT_THREAT ||
+                     threat == ThreatLevel::EXTREME_THREAT ||
                      threat == ThreatLevel::HIGH_THREAT)   ? 1.0f
                   : (threat == ThreatLevel::MED_THREAT)   ? 0.85f : 0.7f;
 
@@ -1983,6 +2192,7 @@ const char* threatText(ThreatLevel t) {
     case ThreatLevel::MED_THREAT:     return "MEDIUM";
     case ThreatLevel::HIGH_THREAT:    return "HIGH";
     case ThreatLevel::EXTREME_THREAT: return "EXTREME";
+    case ThreatLevel::IMMINENT_THREAT: return "IMMINENT";
     default:                          return "UNKNOWN";
   }
 }
@@ -2446,7 +2656,7 @@ AirframeClass nearestAirframe() {
 // list, and TARGET wanted all three every frame while loop() wanted one for
 // the dwell. None of the inputs change between polls, so loop() computes them
 // once, after the fetch and its identity lookups have both run.
-struct NearestFlags { bool rotor, loiter, mil; int cat; char type[6]; };
+struct NearestFlags { bool rotor, loiter, mil; uint8_t form; int cat; char type[6]; };
 NearestFlags nearestFlags;
 
 void refreshNearestFlags() {
@@ -2460,12 +2670,33 @@ void refreshNearestFlags() {
   // is always looked up, so the type-code half is genuinely available here
   // even though it is not for most blips.
   nearestFlags.mil    = nearest.valid && isMilitary(nearest.icao24, acTypeFor(nearest.icao24));
+  // Latched formation size, 0 when alone. Read after detectFormations() has
+  // run for this poll, so unlike the target tier it is not a poll behind.
+  nearestFlags.form   = nearest.valid ? formationSizeFor(nearest.icao24) : 0;
 }
 int  nearestCategory()   { return nearestFlags.cat;    }   // identity applied
 const char* nearestType(){ return nearestFlags.type;   }   // "" if unresolved
 bool nearestIsRotor()    { return nearestFlags.rotor;  }
 bool nearestLoitering()  { return nearestFlags.loiter; }
 bool nearestIsMilitary() { return nearestFlags.mil;    }
+uint8_t nearestFormation(){ return nearestFlags.form;   }   // >= 2 when in one
+
+// The inverted "x3" tag drawn beside a callsign on RADAR and INTEL: same
+// treatment as the banners, so a formation reads the same on every page.
+// Right-aligned at `right`, baseline `y`, 5x7. Returns its width, 0 if none.
+int drawFormationTag(int right, int y) {
+  uint8_t n = nearestFormation();
+  if (n < 2) return 0;
+  char tag[6];
+  snprintf(tag, sizeof(tag), "x%u", n);
+  int w = strlen(tag) * 5 + 3;
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawBox(right - w, y - 7, w, 9);
+  u8g2.setDrawColor(0);
+  u8g2.drawStr(right - w + 2, y, tag);
+  u8g2.setDrawColor(1);
+  return w;
+}
 
 void screenNearest() {
   drawHeader("TARGET");
@@ -2542,22 +2773,38 @@ void screenNearest() {
   // like), and collapsing that to just "MILITARY" would throw away the more
   // specific fact. Loiter still wins the wording, since a contact holding
   // station is the interesting case, and it blinks to say so.
-  // Longest string is "MIL ROTOR LOIT" at 73 px, still clear of x=98.
+  //
+  // A formation appends its size ("ROTOR FLT x3", "MIL FLT x3") and shortens
+  // the rest to make room. Longest strings are "MIL ROTOR LOIT" and
+  // "ROTOR LOIT x3" at 73 px, still clear of x=98.
   {
-    bool rotor  = nearestIsRotor();
-    bool loiter = nearestLoitering();
-    bool mil    = nearestIsMilitary();
+    bool    rotor  = nearestIsRotor();
+    bool    loiter = nearestLoitering();
+    bool    mil    = nearestIsMilitary();
+    uint8_t formN  = nearestFormation();
 
+    char        buf[16];
     const char* msg = nullptr;
-    if      (mil && loiter) msg = "MIL ROTOR LOIT";
+    if (formN >= 2) {
+      const char* what;
+      if      (mil && loiter) what = "MIL LOIT";
+      else if (mil && rotor)  what = "MIL ROTOR";
+      else if (mil)           what = "MIL FLT";
+      else if (loiter)        what = "ROTOR LOIT";
+      else if (rotor)         what = "ROTOR FLT";
+      else                    what = "FLIGHT";       // cannot happen: a member is rotor or mil
+      snprintf(buf, sizeof(buf), "%s x%u", what, formN);
+      msg = buf;
+    }
+    else if (mil && loiter) msg = "MIL ROTOR LOIT";
     else if (mil && rotor)  msg = "MIL ROTOR";
     else if (mil)           msg = "MILITARY";
     else if (loiter)        msg = "ROTOR LOITER";
     else if (rotor)         msg = "ROTORCRAFT";
 
-    // Military blinks too: it is the rarer event of the two and should catch
-    // the eye even when the contact is not holding station.
-    if (msg && (!(loiter || mil) || ((millis() / 500) & 1))) {
+    // Military and formation blink too: the rarer events should catch the
+    // eye even when the contact is not holding station.
+    if (msg && (!(loiter || mil || formN >= 2) || ((millis() / 500) & 1))) {
       int w = strlen(msg) * 5 + 3;
       u8g2.drawBox(0, 56, w, 8);
       u8g2.setDrawColor(0);
@@ -2582,6 +2829,7 @@ void screenDetails() {
 
   u8g2.setFont(u8g2_font_6x12_tr);
   u8g2.drawStr(0, 20, nearest.callsign);
+  drawFormationTag(128, 20);   // an 8-char callsign ends at x=48; the tag needs 18
 
   u8g2.setFont(u8g2_font_5x7_tr);
   snprintf(line, sizeof(line), "LINE %s", rt ? rt->airline : airlineName(nearest.callsign));
@@ -2664,20 +2912,22 @@ void screenRadar() {
     float brg = (float)rad2deg(atan2(x, y));
     if (brg < 0.0f) brg += 360.0f;
 
-    if (isRotor(blips[i].cat)) {
+    if (isRotor(blips[i].cat) || blips[i].form >= 2) {
       // A cross reads as distinct from the plain dots even at this scale, and
       // rotorcraft deliberately skip the persistence fade -- a special contact
       // should not thin out to one pixel between sweeps. Loitering adds a
-      // pulsing ring, which is the part that actually catches the eye.
+      // pulsing ring, which is the part that actually catches the eye. Every
+      // member of a latched formation gets the cross and the tick as well,
+      // military fixed-wing included: each ship should register on its own.
       u8g2.drawHLine(bx - 2, by, 5);
       u8g2.drawVLine(bx, by - 2, 5);
       if (blips[i].loiter && ((millis() / 400) & 1)) u8g2.drawCircle(bx, by, 4);
 #if BUZZER_ENABLE && BUZZER_SWEEP_BLIP
       // Chirp as the beam crosses it -- the classic radar tick, but only for
-      // rotorcraft, only inside BUZZER_RANGE_KM, and only while this screen is
-      // up, which keeps it to a few ticks per screen cycle instead of a sonar.
-      // The crossing geometry, range gate and chirp queue are hardware-verified;
-      // only the rotor-only path itself still awaits a live helicopter.
+      // rotorcraft and formation members, only inside BUZZER_RANGE_KM, and
+      // only while this screen is up, which keeps it to a few ticks per
+      // screen cycle instead of a sonar. The crossing geometry, range gate
+      // and chirp queue are hardware-verified.
       if (dist <= BUZZER_RANGE_KM && sweptPast(prevSweepDeg, sweepDeg, brg))
         buzzerSweepBlip();
 #endif
@@ -2729,6 +2979,9 @@ void screenRadar() {
   } else {
     u8g2.drawStr(px, 32, nearest.callsign);
   }
+  // Formation size, inverted at the right of the same row. An 8-character
+  // callsign in its military box ends at x=105; a two-digit tag needs 18.
+  drawFormationTag(128, 32);
 
   char l[20];
   snprintf(l, sizeof(l), "RNG %.0fkm", nearest.distanceKm);
@@ -2847,9 +3100,10 @@ void screenWeapons() {
   float altFt   = haveAlt ? nearest.altitudeM * 3.28084f : NAN;
   AltitudeBand band = classifyAltitude(altFt, haveAlt);
 
+  uint8_t formN = fresh ? nearestFormation() : 0;
   ThreatLevel threat = classifyThreat(nearest.bearingDeg, nearest.trackDeg,
                                       nearest.distanceKm, altFt, haveAlt, fresh,
-                                      af, fresh && nearestIsMilitary());
+                                      af, fresh && nearestIsMilitary(), formN >= 2);
 
   uint8_t wsIdx = selectWeaponSystem(af, band, fresh ? nearest.distanceKm : 0.0);
   WeaponSystemRecord w;
@@ -2896,18 +3150,23 @@ void screenWeapons() {
   u8g2.drawHLine(0, 27, 128);
 
   // Four rows of label/value pairs, 9 px pitch.
-  // Row 1: target | altitude band
+  // Row 1: target | altitude band. A formation shows its size in place of
+  // the HELI suffix ("TGT H60 x3"); the column is 13 characters.
   const char* typ = fresh ? nearestType() : "";
-  if (!fresh)      snprintf(line, sizeof(line), "TGT ---");
-  else if (typ[0]) snprintf(line, sizeof(line), "TGT %s%s", typ, isRotor(cat) ? " HELI" : "");
-  else             snprintf(line, sizeof(line), "TGT %s", airframeShort(af));
+  if (!fresh)          snprintf(line, sizeof(line), "TGT ---");
+  else if (formN >= 2) snprintf(line, sizeof(line), "TGT %s x%u", typ[0] ? typ : airframeShort(af), formN);
+  else if (typ[0])     snprintf(line, sizeof(line), "TGT %s%s", typ, isRotor(cat) ? " HELI" : "");
+  else                 snprintf(line, sizeof(line), "TGT %s", airframeShort(af));
   u8g2.drawStr(0, 36, line);
   snprintf(line, sizeof(line), "ALT %s", altBandText(band));
   u8g2.drawStr(C2, 36, line);
 
-  // Row 2: threat (inverted when EXTREME, like the banners) | solution
+  // Row 2: threat (inverted when EXTREME, like the banners; IMMINENT pulses
+  // between inverted and plain, so the row is never blank) | solution
   snprintf(line, sizeof(line), "THR %s", threatText(threat));
-  if (threat == ThreatLevel::EXTREME_THREAT) {
+  bool thrInvert = threat == ThreatLevel::EXTREME_THREAT ||
+                   (threat == ThreatLevel::IMMINENT_THREAT && ((millis() / 500) & 1));
+  if (thrInvert) {
     u8g2.drawBox(-1, 38, strlen(line) * 5 + 3, 9);
     u8g2.setDrawColor(0);
     u8g2.drawStr(1, 45, line);
