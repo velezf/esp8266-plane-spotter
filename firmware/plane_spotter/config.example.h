@@ -117,6 +117,30 @@
 #define MAX_MIL         8
 #define MIL_EXPIRE_MS   300000   // 5 min
 
+// ---- Formations ----------------------------------------------------------
+// Two or more special contacts (rotorcraft or military) flying together. A
+// pair is in formation when they are within FORMATION_SEP_KM of each other
+// AND their velocity vectors differ by less than FORMATION_DV_KMH -- that one
+// number tests track and speed together, so a crossing pair (close, but
+// diverging) does not count. Membership has to hold for FORMATION_MIN_POLLS
+// consecutive polls before it latches, which rejects a single-poll
+// coincidence; the count is in polls, so it scales with UPDATE_INTERVAL_MS.
+//
+// The separation is loose on purpose: OpenSky's per-aircraft position times
+// within one poll can differ by several seconds, and at 50 m/s that is ~500 m
+// of apparent spacing between two ships flying wingtip to wingtip. Neither
+// figure has been tuned against a real pair yet -- see CLAUDE.md.
+//
+// The count is a lower bound. Military flights often have one ship on ADS-B
+// and the rest dark, so a single contact may still be a three-ship. Nothing
+// this module can see fixes that.
+#define FORMATION_SEP_KM      2.0
+#define FORMATION_DV_KMH      40.0
+#define FORMATION_MIN_POLLS   2      // consecutive polls (= 60 s at 30 s)
+// Lead selection hysteresis: the current target keeps the pages unless
+// another member is this far further forward along the flight's track.
+#define FORMATION_LEAD_HYST_KM  0.5
+
 // ---- Piezo buzzer (rotorcraft alerts) ------------------------------------
 // Passive buzzer -- it has no oscillator of its own, so the firmware drives it
 // with tone(). 3-pin module: VCC->3V3, GND->GND, S/IO->PIN_BUZZER. Bare 2-pin

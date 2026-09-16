@@ -26,6 +26,12 @@ pio device monitor -b 115200                   # serial, 115200
 pio run -t clean
 ```
 
+The xtensa toolchain PlatformIO installs for this platform is an x86_64
+binary. On Apple Silicon it needs Rosetta, and every `pio run` fails at the
+sketch-conversion step with `Bad CPU type in executable` without it. The fix
+is `softwareupdate --install-rosetta --agree-to-license`, which is a system
+change and is left to the owner. (Seen 2026-09-16 after the macOS 27 update.)
+
 Before the first build, `cp firmware/plane_spotter/config.example.h
 firmware/plane_spotter/config.h` and fill it in — `config.h` is git-ignored
 (it holds WiFi credentials and the OpenSky client secret) but is `#include`d
@@ -125,7 +131,12 @@ code came back. Two consequences: the tier uses `cat` as resolved *that* poll,
 so a fast rotorcraft outranks one poll after it is first queued for identity;
 and `targetBlip` carries the chosen blip's index so the radar rings the target
 rather than the nearest dot. `stats.closestEver` tracks true closest
-separately. The override applies inside `TARGET_PRIORITY_RANGE_KM` (17 km,
+separately. A latched formation (see *Formations*) sits above all four tiers,
+and within it the **lead** wins rather than the closest member: the projection
+of position onto the shared velocity, with a `FORMATION_LEAD_HYST_KM` bonus for
+the incumbent so two ships abreast do not trade the pages every poll.
+Membership is read from the persistent tables, so it is one poll behind, the
+same lag the tier already has for resolved type codes. The override applies inside `TARGET_PRIORITY_RANGE_KM` (17 km,
 sketch default, overridable from `config.h`); beyond it closest wins. It began
 uncapped and a departing Black Hawk held the pages from 25 km out over
 airliners passing overhead, which was judged too much. Because fetches are 30 s apart but the
@@ -260,8 +271,10 @@ that screen (`loop()` computes `dwell` locally rather than reading
 `SCREEN_SWAP_MS[]` directly).
 
 Loiter detection needs identity across fetches, which `blips[]` cannot provide —
-it is rebuilt from scratch every poll. `helis[]` (`MAX_HELI` 4, keyed by icao24)
-holds an anchor position per airframe: stay within `LOITER_RADIUS_KM` for
+it is rebuilt from scratch every poll. `helis[]` (`MAX_HELI` 8, keyed by icao24;
+sized like `MAX_MIL` for a formation plus a couple of singles, since eviction
+resets a member's formation count and re-alerts it) holds an anchor position
+per airframe: stay within `LOITER_RADIUS_KM` for
 `LOITER_MIN_MS` and it latches as loitering; drift outside and the anchor resets,
 because that is transit rather than orbit.
 
@@ -280,20 +293,22 @@ discriminating on track swing rather than displacement.
 
 ### Buzzer
 
-A passive buzzer on `PIN_BUZZER` (D6/GPIO12). **Four** voices, for rotorcraft
-and military contacts:
+A passive buzzer on `PIN_BUZZER` (D6/GPIO12). **Five** voices, for rotorcraft,
+military and formation contacts:
 
 | Voice | Pattern | Fires on |
 |---|---|---|
-| `buzzerSweepBlip` | 1 × 4000 Hz, 25 ms | sweep crossing a rotorcraft |
+| `buzzerSweepBlip` | 1 × 4000 Hz, 25 ms | sweep crossing a rotorcraft or formation member |
 | `buzzerMilitary`  | 4 × 4500 Hz, 40 ms | military contact arriving |
+| `buzzerFormation` | 6 × 3500 Hz, 50 ms | formation latch (priority 2) |
 | `buzzerAcquire`   | 2 × 3000 Hz, 60 ms | rotorcraft acquisition |
 | `buzzerLoiter`    | 3 × 2200 Hz, 120 ms | loiter latch |
 
 They are separated on both axes a single piezo can express — pitch and rhythm.
 Read down the table: pitch falls as pulses get longer. Military sits at the top
 deliberately, fastest and highest, a trill rather than a beat, so it does not
-read as "more of the rotorcraft alert". All four are gated on `BUZZER_RANGE_KM`
+read as "more of the rotorcraft alert". Formation is the longest run by far and
+the only voice at priority 2, so it cuts anything else. All five are gated on `BUZZER_RANGE_KM`
 and suppressed during quiet hours — which fall *open* (audible) until NTP syncs,
 so a clock that never sets cannot silence it.
 
@@ -309,7 +324,7 @@ could not sound for any contact that did not pop into existence already close
 chime. The loiter flag resets on re-anchor so a second orbit alerts again.
 
 **Priority, not first-come.** `buzzerChirp()` takes a priority: the sweep
-tick is 0, the three alerts are 1. A higher priority cuts a lower one that is
+tick is 0, the three arrival alerts are 1, formation is 2. A higher priority cuts a lower one that is
 sounding; equal priority is first-come, so alerts never cut each other short
 and a tick still cannot stomp the tail of a loiter alert. This replaced a plain
 "in flight wins" rule under which a military trill arriving during a 25 ms
@@ -450,11 +465,53 @@ to just "MILITARY" would discard the more specific fact. There is only room for
 one banner, so precedence picks it; loiter still wins the wording. Military
 blinks even without loiter, being the rarer event.
 
+### Formations
+
+Two or more special contacts (rotorcraft or military) moving together. This is
+the "worth running outside for" event, and nothing else in the firmware could
+see it: every other tracker looks at one airframe at a time.
+
+`detectFormations()` runs once per poll, after the parse loop and before the
+expiry passes, over `blips[]` — the flat frame already holds every contact's
+position and velocity, so a pair test is one squared distance and one squared
+velocity difference. **The velocity-difference magnitude is the discriminator**,
+not track angle: it tests speed and heading in one number with no wrap, and it
+is what rejects a crossing pair (close, diverging) and today's spread-out trio
+(same heading, kilometres apart). Candidates are rotorcraft and military blips
+with known kinematics; a `vx = vy = 0` contact is excluded because two of them
+would agree perfectly, the same missing-data trap as the NAN rule. Union-find
+over the candidates gives cluster sizes, so a chain A–B–C is one three-ship.
+
+Persistence is per airframe in `helis[]` / `milSeen[]` (both, for a military
+rotorcraft): `formPolls` counts consecutive clustered polls and latches at
+`FORMATION_MIN_POLLS`; breaking formation resets the count and the alert flag,
+so a flight that splits and re-forms alerts again, like the loiter re-anchor.
+Blips carry their icao24 for the poll purely so this pass can find the table
+entry — it is a key, not identity that survives a fetch. Three members latching
+on the same poll produce three `buzzerFormation()` calls that collapse to one
+voice, which is the intended "one event, one alert".
+
+On screen a formation shows everywhere the target does: the TARGET banner
+appends the size (`ROTOR FLT x3`, `MIL FLT x3`, `ROTOR LOIT x3`; longest 73 px,
+same limit as before), RADAR and INTEL draw an inverted `x3` tag beside the
+callsign via `drawFormationTag()`, every member gets the radar cross and the
+sweep tick — military fixed-wing included, since each ship should register on
+its own — and WEAPONS reads `THR IMMINENT` (pulsing) with `TGT H60 x3`. The
+join line between members was considered and skipped.
+
+`FORMATION_SEP_KM` is loose (2 km) because OpenSky's per-aircraft position
+times within one poll differ by seconds, which at rotorcraft speeds is hundreds
+of metres of false spacing. **Neither threshold has been tuned on a real
+pair.** The count is a lower bound: military flights often have one ship on
+ADS-B and the rest dark, and nothing this module can see fixes that — it is a
+job for a future project that detects non-ADS-B traffic.
+
 ### Threat gating
 
-`classifyThreat()` is identity first, geometry second: a rotorcraft is
-**EXTREME** unconditionally and a military fixed-wing floors at **HIGH**; only
-civil fixed-wing traffic is scored by geometry (`classifyThreatGeometry()`).
+`classifyThreat()` is identity first, geometry second: a formation member is
+**IMMINENT** unconditionally, a rotorcraft is **EXTREME** and a military
+fixed-wing floors at **HIGH**; only civil fixed-wing traffic is scored by
+geometry (`classifyThreatGeometry()`).
 That is a product decision, not a modelling one — around here the rotorcraft
 is what the device exists for, and scoring one LOW because it was tracking
 away read as broken. EXTREME is drawn inverted on WEAPONS like the banners.
@@ -658,8 +715,17 @@ these:
   also exercised chirp priority, `buzzerPause()`, the flat-coordinate radar,
   the route cache and weather over HTTP/1.0 in ordinary running.
 
-Nothing is currently known to be unverified. The rest of this section is
-kept for the next time something is.
+**Unverified: the formation feature** (September 2026 `feat/formations`).
+The clustering, latch, split/re-form and range-entry logic was host-tested
+against the shipped source with the awk-extract harness (nine scenarios, all
+passing), but nothing downstream has been seen on hardware: the fifth voice,
+the `x3` banners and tags, the cross and tick on a military fixed-wing member,
+`THR IMMINENT`, the lead selection and its hysteresis, and the RAM cost (the
+footprint figures above predate it; `Blip` grew by 8 bytes, `MAX_HELI` went
+from 4 to 8). The build itself could not be run on the machine that wrote it
+(see the Rosetta note under *Commands*). Force it the usual way: a throwaway
+build that clones the nearest blip twice with a small offset and the same
+velocity latches a three-ship in two polls.
 
 **How the rest got closed, because it applies to whatever is unverified next:**
 forcing the state beats waiting for it. Rather than wait weeks for a helicopter,
