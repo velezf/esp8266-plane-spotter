@@ -167,6 +167,14 @@
 // Set to 0 for a bare 2-pin piezo or an NPN-driven module (idle LOW).
 #define BUZZER_ACTIVE_LOW  1
 
+// Open-drain drive. Set to 1 only if a PNP (active-low) module has its VCC on
+// 5 V instead of 3V3 and cannot be rewired: a 3.3 V push-pull HIGH cannot turn
+// a 5 V PNP off, which sounds as a constant scratchy buzz that no polarity
+// setting fixes. Open-drain releases the pin instead of driving it high. The
+// pin then sits at ~4.3 V, outside the ESP8266 datasheet but with no current
+// flowing. Wiring VCC to 3V3 is the proper fix; leave this 0 if you did.
+#define BUZZER_OPEN_DRAIN  0
+
 // Only sound off for rotorcraft closer than this. The radar ring is 30 km, so
 // something well inside that is the interesting case.
 #define BUZZER_RANGE_KM  15.0

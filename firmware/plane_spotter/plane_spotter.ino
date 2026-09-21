@@ -1729,6 +1729,34 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
 // Level that leaves the buzzer silent. See BUZZER_ACTIVE_LOW in config.h.
 #define BUZZER_IDLE_LEVEL (BUZZER_ACTIVE_LOW ? HIGH : LOW)
 
+// Open-drain drive, for a PNP module whose VCC is on 5 V rather than 3V3. A
+// push-pull HIGH is 3.3 V, which still leaves ~1.7 V across the transistor's
+// base-emitter junction, so it never switches off and the element plays supply
+// ripple -- a constant scratchy buzz under every voice, at either idle level.
+// Open-drain "high" releases the pin instead: no base current, silence. The
+// pin then floats to ~4.3 V through the module's base resistor, which is
+// outside the datasheet's 3.6 V but carries no current. See config.h.
+#ifndef BUZZER_OPEN_DRAIN
+#define BUZZER_OPEN_DRAIN 0
+#endif
+#if BUZZER_OPEN_DRAIN && !BUZZER_ACTIVE_LOW
+#error "BUZZER_OPEN_DRAIN only makes sense with BUZZER_ACTIVE_LOW 1: released is the silent state"
+#endif
+#define BUZZER_PIN_MODE (BUZZER_OPEN_DRAIN ? OUTPUT_OPEN_DRAIN : OUTPUT)
+
+// The only two ways the pin is driven. tone() forces pinMode(OUTPUT) every
+// time it starts, and noTone() ends with a push-pull digitalWrite(pin, 0), so
+// the mode is put back after each; pinMode() does not disturb a running tone.
+static void buzzerToneOn(uint16_t freq) {
+  tone(PIN_BUZZER, freq);
+  pinMode(PIN_BUZZER, BUZZER_PIN_MODE);
+}
+static void buzzerToneOff() {
+  noTone(PIN_BUZZER);
+  pinMode(PIN_BUZZER, BUZZER_PIN_MODE);
+  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+}
+
 static uint8_t  chirpsLeft  = 0;
 static bool     chirpOn     = false;   // a chirp is currently sounding
 static uint16_t chirpFreq   = 0;
@@ -1762,8 +1790,7 @@ void buzzerChirp(uint8_t prio, uint8_t count, uint16_t freq, uint16_t onMs, uint
   if (busy && prio <= chirpPrio) return;
   if (buzzerQuietNow()) return;
   if (chirpOn) {                          // cut the outranked tone right now
-    noTone(PIN_BUZZER);
-    digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+    buzzerToneOff();
     chirpOn = false;
   }
   chirpPrio   = prio;
@@ -1786,12 +1813,11 @@ void buzzerService() {
   if ((int32_t)(now - chirpNextMs) < 0) return;
 
   if (chirpOn) {
-    noTone(PIN_BUZZER);
-    digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+    buzzerToneOff();
     chirpOn     = false;
     chirpNextMs = now + chirpGapMs;
   } else {
-    tone(PIN_BUZZER, chirpFreq);
+    buzzerToneOn(chirpFreq);
     chirpOn     = true;
     chirpsLeft--;
     chirpNextMs = now + chirpOnMs;
@@ -1806,8 +1832,7 @@ void buzzerService() {
 // service call after the fetch returns.
 void buzzerPause() {
   if (!chirpOn) return;
-  noTone(PIN_BUZZER);
-  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+  buzzerToneOff();
   chirpOn     = false;
   chirpNextMs = millis() + chirpGapMs;
 }
@@ -3246,10 +3271,11 @@ void setup() {
   // Park the pin at its idle level before anything else, so the buzzer is not
   // sounding between boot and the first chirp. Which level that is depends on
   // the module: an active-low (PNP) one idles HIGH.
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+  buzzerToneOff();
   Serial.printf("[buzz] enabled on GPIO%d (%s), range %.0f km, quiet %02d:00-%02d:00\n",
-                PIN_BUZZER, BUZZER_ACTIVE_LOW ? "active-low" : "active-high",
+                PIN_BUZZER,
+                BUZZER_OPEN_DRAIN ? "active-low, open-drain"
+                                  : BUZZER_ACTIVE_LOW ? "active-low" : "active-high",
                 (double)BUZZER_RANGE_KM,
                 BUZZER_QUIET_START, BUZZER_QUIET_END);
 #endif
