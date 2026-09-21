@@ -30,7 +30,9 @@ The xtensa toolchain PlatformIO installs for this platform is an x86_64
 binary. On Apple Silicon it needs Rosetta, and every `pio run` fails at the
 sketch-conversion step with `Bad CPU type in executable` without it. The fix
 is `softwareupdate --install-rosetta --agree-to-license`, which is a system
-change and is left to the owner. (Seen 2026-09-16 after the macOS 27 update.)
+change and is left to the owner. (Seen 2026-09-16 after the macOS 27 update;
+installed and building again as of 2026-09-21. `arch -x86_64 /usr/bin/true`
+is the quick check.)
 
 Before the first build, `cp firmware/plane_spotter/config.example.h
 firmware/plane_spotter/config.h` and fill it in — `config.h` is git-ignored
@@ -169,7 +171,7 @@ of those, not in `blips[]`.
 
 ### Memory constraints
 
-Current footprint: **47.8% static RAM, 45.7% flash** (`pio run` reports both).
+Current footprint: **48.4% static RAM, 46.5% flash** (`pio run` reports both).
 Note that on this chip `.rodata` counts against RAM, so string literals and
 libm tables cost DRAM — compare builds with `xtensa-lx106-elf-nm -S` on the ELF
 when a change grows RAM by more than its structs explain.
@@ -353,6 +355,30 @@ are easy to get backwards:
 `tone(pin, freq, duration)`. `BUZZER_ACTIVE_LOW` covers the other polarity (bare
 2-pin element or NPN module).
 
+**The module's VCC belongs on 3V3, and the second box has it on 5 V.** A PNP
+switch only turns off when its base reaches its own supply, and a push-pull
+HIGH is 3.3 V — against a 5 V emitter that still leaves ~1.7 V across the
+junction, so the transistor sits half-on and the element plays WiFi and OLED
+supply ripple: a constant scratchy buzz under every voice. The tell is that it
+is there at **both** idle levels, so flipping `BUZZER_ACTIVE_LOW` changes
+nothing (that lead cost several reflashes on 2026-09-21), while tones still
+sound over it. A series resistor in the signal line does not fix it either.
+
+`BUZZER_OPEN_DRAIN 1` is the software cure, for a box whose buzzer is already
+glued in: open-drain "high" releases the pin instead of driving it, no base
+current flows, and the module is silent. The pin then floats to ~4.3 V through
+the module's base resistor — outside the datasheet's 3.6 V, accepted here
+because no current flows and the ESP8266 GPIOs have no clamp diode to VDD. The
+two boxes therefore differ in `config.h`: the original (3V3) runs `0`, the
+second (5 V) runs `1`. It is a compile error with `BUZZER_ACTIVE_LOW 0`,
+where released would not be the silent state.
+
+All pin driving goes through `buzzerToneOn()` / `buzzerToneOff()`, and the
+reason is a second trap in the core: `tone()` calls `pinMode(pin, OUTPUT)`
+every time it starts, silently undoing open-drain, and `noTone()` finishes
+with a push-pull write. The helpers re-apply the mode after each; `pinMode()`
+does not disturb a running waveform. Do not call `tone()`/`noTone()` directly.
+
 Voices sit at 4000 / 3000 / 2200 Hz. These elements have no oscillator and want
 **2–5 kHz** — below ~2 kHz they go noticeably quiet, so keep new tones in band.
 
@@ -364,8 +390,9 @@ GPIO mux and cannot do `tone()`; GPIO0/GPIO2 must be HIGH at boot and a buzzer
 coil dragging them down prevents booting; GPIO15 must be LOW at boot. GPIO12 is
 free in both display builds.
 
-`BUZZER_ENABLE`, `BUZZER_ACTIVE_LOW` and `BUZZER_SWEEP_BLIP` are independent
-compile-time switches — check the combinations still build when touching this.
+`BUZZER_ENABLE`, `BUZZER_ACTIVE_LOW`, `BUZZER_OPEN_DRAIN` and
+`BUZZER_SWEEP_BLIP` are compile-time switches — check the combinations still
+build when touching this (`OPEN_DRAIN 1` + `ACTIVE_LOW 0` is meant to fail).
 
 ### Aircraft identity lookup
 
@@ -698,6 +725,12 @@ these:
   `buzzerChirp`/`buzzerService` path — not raw `tone()` — and were audible in
   the finished enclosure against bar-level ambient noise. The by-hand
   `BUZZER_IDLE_LEVEL` restore does prevent the `noTone()` drone.
+- **Open-drain buzzer drive** (`BUZZER_OPEN_DRAIN 1`), on the second box with
+  the module on 5 V, 2026-09-21: silent at idle with WiFi and the OLED
+  running, and all **five** voices — the formation voice included — heard
+  through the real `buzzerChirp`/`buzzerService` path from a throwaway build
+  that cycled them. That box also confirmed a second SSD1309 panel on the same
+  pins, init variant and no reset line.
 - **The sweep-chirp trigger chain.** `sweptPast()` crossing geometry (`sweep`
   landed within a few degrees of `brg` on every tick), the `BUZZER_RANGE_KM`
   gate, the screen gate, and the chirp queue.
@@ -718,12 +751,14 @@ these:
 **Unverified: the formation feature** (September 2026 `feat/formations`).
 The clustering, latch, split/re-form and range-entry logic was host-tested
 against the shipped source with the awk-extract harness (nine scenarios, all
-passing), but nothing downstream has been seen on hardware: the fifth voice,
-the `x3` banners and tags, the cross and tick on a military fixed-wing member,
-`THR IMMINENT`, the lead selection and its hysteresis, and the RAM cost (the
-footprint figures above predate it; `Blip` grew by 8 bytes, `MAX_HELI` went
-from 4 to 8). The build itself could not be run on the machine that wrote it
-(see the Rosetta note under *Commands*). Force it the usual way: a throwaway
+passing), but nothing downstream has been seen on hardware except the fifth
+voice (heard, see above): the `x3` banners and tags, the cross and tick on a military fixed-wing member,
+`THR IMMINENT`, and the lead selection and its hysteresis. It does build and
+run — the footprint figures above include it. Fetch-path free heap read
+5.5–7.8 KB over an afternoon of ordinary polls on 2026-09-21, a little under
+the ~8 KB recorded before it, but that build also carried uncommitted work
+that widens the JSON filter by two fields, so the formation share of the drop
+is not isolated. Force it the usual way: a throwaway
 build that clones the nearest blip twice with a small offset and the same
 velocity latches a three-ship in two polls.
 

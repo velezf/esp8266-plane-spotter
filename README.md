@@ -55,6 +55,7 @@ see the rate-limit note below).
 |------|-------|
 | ESP8266 board | NodeMCU v2/v3, Wemos D1 mini, or similar |
 | 0.96" OLED, **SSD1306**, **I²C** | 4-pin module: `GND VCC SCL SDA` |
+| Passive buzzer module (optional) | 3-pin, `VCC GND S`; alerts for rotorcraft, military and formation contacts |
 
 ### Wiring
 
@@ -88,6 +89,24 @@ software I²C master, so any GPIO pair works as long as the pins are passed to
 > Pin order varies between panels (`GND VCC SCL SDA` vs `VCC GND SCL SDA`) — match
 > the silkscreen labels, not the position. `setup()` probes both `0x3C` and `0x3D`
 > and uses whichever answers, so either module variant works unmodified.
+
+#### Buzzer (optional)
+
+| Buzzer pin | ESP8266 (NodeMCU label / GPIO) | Note |
+|------------|-------------------------------|------|
+| VCC | **3V3** — not 5V/VIN | see below |
+| GND | GND | |
+| S / IO | **D6 / GPIO12** | `PIN_BUZZER` in `config.h` |
+
+> **Power the module from 3V3.** The common 3-pin modules switch the element
+> with a PNP transistor, which only turns off when the signal pin reaches the
+> module's own supply. From 5 V, a 3.3 V GPIO can never get there, and the
+> buzzer hisses and crackles constantly underneath every alert — at either
+> `BUZZER_ACTIVE_LOW` setting. If it is already built that way and cannot be
+> rewired, set `BUZZER_OPEN_DRAIN 1` in `config.h`: the pin is released instead
+> of driven high, which silences it. That leaves the pin idling at ~4.3 V,
+> above the ESP8266's rated 3.6 V; it carries no current and works in practice,
+> but 3V3 is the proper fix. Set `BUZZER_ENABLE 0` to build without a buzzer.
 
 #### Using the 7-pin SPI panel instead
 
