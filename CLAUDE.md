@@ -678,10 +678,10 @@ time, have nothing but the kinematic guess to go on.
 
 ## Workflow
 
-**Ask before `git commit` or `git push`.** An instruction about *where* work
-should go ("do this on a feat/ branch") is not authorization to commit it, and
-approval for one commit does not carry to the next. Creating a branch and
-building on it unprompted is fine; committing and pushing is not.
+Approval gates are global (`~/.claude/CLAUDE.md` "Approval gates"): ask before
+`git commit` or `git push`; a branch instruction is not commit authorization.
+Cross-project conventions and the papercuts log: `~/code/CLAUDE.md`. Creating a
+branch and building on it unprompted is fine; committing and pushing is not.
 
 Feature work goes on a `feat/…` branch, merged to `main` with `--no-ff`, and the
 branch is deleted both locally and on `fork` once merged.
