@@ -97,6 +97,12 @@
 #define LOITER_RADIUS_KM  3.0
 #define LOITER_MIN_MS     120000   // 2 min (= 4 polls at the default 30 s)
 #define HELI_EXPIRE_MS    300000   // 5 min
+// OpenSky keeps serving an aircraft's last known position for minutes after
+// its receivers lose it. A position older than this many seconds is treated
+// as a repeat, not a sample: it does not count toward loitering and is not
+// paired into a formation. Optional -- the sketch defaults to 20. Not yet
+// tuned against live data; see CLAUDE.md.
+#define STALE_POS_S       20
 
 // ---- Military contacts ---------------------------------------------------
 // Detected from the icao24 address block (free -- it is in every state vector,

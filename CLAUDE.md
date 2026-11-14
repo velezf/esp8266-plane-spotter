@@ -492,6 +492,25 @@ to just "MILITARY" would discard the more specific fact. There is only room for
 one banner, so precedence picks it; loiter still wins the wording. Military
 blinks even without loiter, being the rarer event.
 
+### Repeated state vectors
+
+OpenSky keeps serving an aircraft's last known state vector after its
+receivers lose it, identical every poll. `fetchAircraft()` marks a blip
+`stale` when the response `time` minus the vector's `time_position` exceeds
+`STALE_POS_S` (authority: the `#ifndef` default in the sketch); an unknown age
+reads as fresh. Two consumers act on it. `trackRotorcraft()` treats a stale
+poll as no evidence of holding station and pushes the anchor clock forward by
+the gap, because a frozen position sits inside its own loiter radius by
+construction (a UH-1N flying away latched as loitering on exactly that).
+`detectFormations()` pairs only freshly sampled candidates
+(`formationSampled()`), so a stale member counts as out of formation for that
+poll and the flight re-alerts when it re-forms. Holding the latch through a
+coverage gap was tried and dropped: it could only key on "some candidate is
+stale", so an unrelated contact kept a split formation tagged. The threshold
+has not been tuned against live data. Under `LOG_BLIP_DUMP`, `[blip]` lines
+carry a `STALE` suffix and `[form] pair` prints separation and velocity
+difference for every near pair, joined or not.
+
 ### Formations
 
 Two or more special contacts (rotorcraft or military) moving together. This is
