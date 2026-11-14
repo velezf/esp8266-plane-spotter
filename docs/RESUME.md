@@ -7,17 +7,15 @@ Last updated: 2026-11-14
 
 ## Status
 
-- `main`: WEAPONS page fails closed when there is no target or the feed is
-  stale. Merged and pushed to `fork`.
-- The board was last flashed from `feat/formation-diagnostics` (before the
-  hold-free tree was committed; same source). It includes the WEAPONS change.
+- `main` carries both pieces of 2026-11-14 work, merged and pushed to `fork`:
+  the WEAPONS page failing closed, and the stale-vector groundwork (stale flag,
+  loiter fix, fresh-only formation pairing, logging).
+- The board was last flashed with the same source as `main`.
 
 ## Open branches
 
-| Branch | State | Next step |
-|---|---|---|
-| `feat/formation-diagnostics` | PARKED. One firmware commit (stale flag, loiter fix, fresh-only pairing, logging) plus the ADR and this file. Not merged, not pushed. | Owner decides whether to merge the groundwork to `main` now or with the detection work. |
-| `feat/weapons-no-target` | CLOSED. Merged to `main`. | Delete the branch and its worktree under `.claude/worktrees/`. |
+None. `feat/weapons-no-target` and `feat/formation-diagnostics` are CLOSED:
+merged to `main` and deleted locally.
 
 ## Backlog
 
