@@ -59,6 +59,14 @@
 #ifndef FORMATION_MIN_POLLS
 #define FORMATION_MIN_POLLS     2
 #endif
+// OpenSky keeps serving an aircraft's last known state vector for minutes
+// after its receivers lose it, byte-identical every poll. A position older
+// than this (response `time` minus the vector's `time_position`) is a repeat,
+// not a sample. 20 s sits between a live vector (a few seconds old) and one
+// that was not refreshed since the previous poll (>= UPDATE_INTERVAL_MS old).
+#ifndef STALE_POS_S
+#define STALE_POS_S             20
+#endif
 #ifndef FORMATION_LEAD_HYST_KM
 #define FORMATION_LEAD_HYST_KM  0.5
 #endif
@@ -226,6 +234,7 @@ struct Blip {
   bool    loiter;   // rotorcraft that has held station (see HeliTrack)
   bool    mil;      // icao24 in a military block, or a military type code
   uint8_t form;     // latched formation size this blip belongs to, 0 if none
+  bool    stale;    // position older than STALE_POS_S: a repeat, not a sample
   // The address, so detectFormations() can find this contact's persistent
   // entry in helis[] / milSeen[] after the parse loop. It is not identity that
   // survives a poll -- blips[] is still rebuilt from scratch -- just a key
@@ -751,15 +760,25 @@ int identityCategory(int cat, const char* icaoType) {
 // `distanceKm` is the contact's range from home, already computed by the
 // caller. It gates both voices on the first poll the contact is inside
 // BUZZER_RANGE_KM, not only on the poll it appeared -- see HeliTrack.
-bool trackRotorcraft(const char* icao, double lat, double lon, double distanceKm) {
+//
+// `stale` marks a repeated state vector (see STALE_POS_S). It keeps the entry
+// alive but is not evidence of holding station: a frozen position sits inside
+// its own anchor radius by construction, and a MUSL UH-1N flying away at
+// 170 km/h latched as loitering on exactly that. The anchor clock is pushed
+// forward by the gap so unsampled time does not count toward LOITER_MIN_MS.
+bool trackRotorcraft(const char* icao, double lat, double lon, double distanceKm,
+                     bool stale) {
   uint32_t now = millis();
   if (icao == nullptr || icao[0] == '\0') return false;
   bool inRange = distanceKm <= BUZZER_RANGE_KM;
 
   for (uint8_t i = 0; i < heliCount; i++) {
     if (strcmp(helis[i].icao24, icao) != 0) continue;
+    if (stale && !helis[i].loitering) helis[i].sinceMs += now - helis[i].lastSeenMs;
     helis[i].lastSeenMs = now;
-    if (haversineKm(helis[i].refLat, helis[i].refLon, lat, lon) > LOITER_RADIUS_KM) {
+    if (stale) {
+      // no new position: nothing to test the anchor against
+    } else if (haversineKm(helis[i].refLat, helis[i].refLon, lat, lon) > LOITER_RADIUS_KM) {
       helis[i].refLat        = lat;    // moved on: re-anchor, it is transiting
       helis[i].refLon        = lon;
       helis[i].sinceMs       = now;
@@ -925,6 +944,16 @@ bool formationCandidate(const Blip& b) {
   return (isRotor(b.cat) || b.mil) && (b.vx != 0.0f || b.vy != 0.0f);
 }
 
+// A candidate whose vector is a real sample this poll. Only these are paired:
+// a repeated vector is an old position against a partner's new one, which
+// reads as kilometres of false spacing, and two repeated vectors agree with
+// their own previous poll and would satisfy FORMATION_MIN_POLLS on one sample.
+// Both were watched on a MUSL two-ship low along the river, where the pair
+// took turns dropping out of receiver coverage.
+bool formationSampled(const Blip& b) {
+  return formationCandidate(b) && !b.stale;
+}
+
 // Fold this poll's cluster size into one table entry. Returns true when the
 // formation is latched after the update; sets `alert` on the poll the voice
 // should sound -- latched, inside BUZZER_RANGE_KM, not yet announced.
@@ -982,13 +1011,26 @@ uint8_t detectFormations() {
   const float dvMax   = (float)(FORMATION_DV_KMH / 3600.0);   // km/s, like vx/vy
   const float dvMax2  = dvMax * dvMax;
   for (uint8_t i = 0; i < blipCount; i++) {
-    if (!formationCandidate(blips[i])) continue;
+    if (!formationSampled(blips[i])) continue;
     for (uint8_t j = i + 1; j < blipCount; j++) {
-      if (!formationCandidate(blips[j])) continue;
+      if (!formationSampled(blips[j])) continue;
       float dx = blips[i].x - blips[j].x, dy = blips[i].y - blips[j].y;
-      if (dx * dx + dy * dy > sepMax2) continue;
       float dvx = blips[i].vx - blips[j].vx, dvy = blips[i].vy - blips[j].vy;
-      if (dvx * dvx + dvy * dvy > dvMax2) continue;
+      float sep2 = dx * dx + dy * dy, dv2 = dvx * dvx + dvy * dvy;
+      bool  join = sep2 <= sepMax2 && dv2 <= dvMax2;
+#if LOG_BLIP_DUMP
+      // Both numbers for every near pair, joined or not. The [blip] dump has no
+      // bearing or track, so without this a pair that refuses to latch cannot
+      // be told apart from one that was never close: a MUSL two-ship sat at
+      // near-identical range and speed for twelve polls with form=0 and the
+      // log could not say which threshold was failing. Neither figure is
+      // relative to home, so this line carries none of [blip]'s privacy cost.
+      if (sep2 <= 25.0f * sepMax2)
+        Serial.printf("[form] pair %s %s sep=%.2fkm dv=%.1fkmh%s\n",
+                      blips[i].icao24, blips[j].icao24,
+                      sqrtf(sep2), sqrtf(dv2) * 3600.0f, join ? " JOIN" : "");
+#endif
+      if (!join) continue;
       uint8_t a = root(i), b = root(j);
       if (a != b) parent[a] = b;
     }
@@ -997,13 +1039,18 @@ uint8_t detectFormations() {
   uint8_t size[MAX_BLIPS];
   memset(size, 0, sizeof(size));
   for (uint8_t i = 0; i < blipCount; i++)
-    if (formationCandidate(blips[i])) size[root(i)]++;
+    if (formationSampled(blips[i])) size[root(i)]++;
 
   uint8_t members = 0;
   for (uint8_t i = 0; i < blipCount; i++) {
     blips[i].form = 0;
     if (!formationCandidate(blips[i])) continue;
-    uint8_t n    = size[root(i)];
+    // A repeated vector is in no cluster this poll, so its count resets like
+    // any other break: a member that drops out of coverage loses the tag and
+    // the flight re-alerts when it re-forms. Holding the latch through the gap
+    // was tried and dropped -- it could only be keyed on "some candidate is
+    // stale", which let an unrelated contact keep a split formation tagged.
+    uint8_t n    = blips[i].stale ? 0 : size[root(i)];
     float   dist = sqrtf(blips[i].x * blips[i].x + blips[i].y * blips[i].y);
     bool    alert;
     bool    latched = formationUpdate(blips[i].icao24, n, dist <= BUZZER_RANGE_KM, alert);
@@ -1202,11 +1249,14 @@ bool fetchAircraft() {
   // Filter: keep only the fields we actually use from every state vector.
   // OpenSky state indices: 0 icao24, 1 callsign, 2 origin_country,
   // 5 longitude, 6 latitude, 7 baro_altitude, 8 on_ground, 9 velocity,
-  // 10 true_track, 11 vertical_rate, 13 geo_altitude.
+  // 10 true_track, 11 vertical_rate, 13 geo_altitude. 3 time_position and the
+  // top-level `time` exist only to tell a live vector from a repeated one --
+  // see STALE_POS_S.
   JsonDocument filter;
   JsonArray el = filter["states"].to<JsonArray>().add<JsonArray>();
   for (int i = 0; i <= 17; i++) el[i] = false;
-  el[0] = el[1] = el[2] = el[5] = el[6] = true;
+  el[0] = el[1] = el[2] = el[3] = el[5] = el[6] = true;
+  filter["time"] = true;
   el[7] = el[8] = el[9] = el[10] = el[11] = el[13] = el[17] = true;
 
   // Parse straight off the socket. Nothing buffers the whole body.
@@ -1251,6 +1301,7 @@ bool fetchAircraft() {
   }
 
   JsonArray states = doc["states"].as<JsonArray>();
+  long respTime = doc["time"] | 0L;
   Aircraft best;
   best.valid      = false;
   best.distanceKm = 1e9;
@@ -1309,18 +1360,24 @@ bool fetchAircraft() {
     // the blip due north and point the TARGET arrow there.
     float trackDeg = s[10].isNull() ? NAN : s[10].as<float>();
 
+    // A repeated vector, not a fresh sample -- see STALE_POS_S. Unknown age
+    // reads as fresh, which is the behaviour before this existed.
+    bool stale = respTime > 0 && !s[3].isNull() &&
+                 respTime - s[3].as<long>() > STALE_POS_S;
+
 #if LOG_BLIP_DUMP
     // One line per contact so a rotorcraft or military contact seen on
     // FlightRadar can be matched against what the gates actually decided --
     // the difference between "rotor=0, no idea why" and a diagnosis. Off by
     // default for the privacy reason documented in config.h: distance-from-home
     // against public aircraft positions trilaterates the device location.
-    Serial.printf("[blip] %s %-8s d=%5.1fkm v=%6.1fkmh alt=%7.1fm cat=%2d%s%s\n",
+    Serial.printf("[blip] %s %-8s d=%5.1fkm v=%6.1fkmh alt=%7.1fm cat=%2d%s%s%s\n",
                   (const char*)(s[0] | "------"), (const char*)(s[1] | ""),
                   d,
                   isfinite(velMs) ? velMs * 3.6f : -1.0f,
                   isfinite(altM)  ? altM         : -1.0f,
-                  cat, isRotor(cat) ? " <-- ROTOR" : "", mil ? " <-- MIL" : "");
+                  cat, isRotor(cat) ? " <-- ROTOR" : "", mil ? " <-- MIL" : "",
+                  stale ? " STALE" : "");
 #endif
 
     if (mil) {
@@ -1336,7 +1393,7 @@ bool fetchAircraft() {
     bool loiter = false;
     if (isRotor(cat)) {
       rotorSeen++;
-      loiter = trackRotorcraft(hexId, lat, lon, d);
+      loiter = trackRotorcraft(hexId, lat, lon, d, stale);
     }
 
     // Flat east/north km from the range and bearing already in hand, with the
@@ -1367,6 +1424,7 @@ bool fetchAircraft() {
       b.loiter = loiter;
       b.mil    = mil;
       b.form   = 0;                          // detectFormations() fills this in
+      b.stale  = stale;
       strncpy(b.icao24, hexId, sizeof(b.icao24) - 1);
       b.icao24[sizeof(b.icao24) - 1] = '\0';
     }
