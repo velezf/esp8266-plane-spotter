@@ -3113,34 +3113,45 @@ void screenSystem() {
 void screenWeapons() {
   drawHeader("WEAPONS");
 
-  // Stale data must not carry the previous contact's solution forward.
-  bool fresh = nearest.valid && lastDataMs != 0 &&
+  // Fail closed. With no target, or a feed gone stale, the page shows no
+  // system, no envelope and no solution -- the same empty state as TARGET. It
+  // used to select a system for an UNKNOWN contact at 0 km and draw the whole
+  // table around dashes, which on an empty sky (the 2026-11-13 national ground
+  // stop) read as a weapon assigned to nothing. A stale feed says so rather
+  // than claiming an empty sky, and must not carry the previous contact's
+  // solution forward.
+  bool fresh = lastDataMs != 0 &&
                (uint32_t)(millis() - lastDataMs) < TRACK_STALE_MS;
+  if (!nearest.valid || !fresh) {
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(0, 30, "NO TARGET");
+    u8g2.drawStr(0, 44, nearest.valid ? "track stale." : "in range.");
+    return;
+  }
 
-  int   cat     = fresh ? nearestCategory() : 0;
-  AirframeClass af = fresh ? classifyAirframeFrom(cat, acTypeFor(nearest.icao24))
-                           : AirframeClass::UNKNOWN;
+  int   cat     = nearestCategory();
+  AirframeClass af = classifyAirframeFrom(cat, acTypeFor(nearest.icao24));
 
-  bool  haveAlt = fresh && !nearest.onGround && isfinite(nearest.altitudeM);
+  bool  haveAlt = !nearest.onGround && isfinite(nearest.altitudeM);
   float altFt   = haveAlt ? nearest.altitudeM * 3.28084f : NAN;
   AltitudeBand band = classifyAltitude(altFt, haveAlt);
 
-  uint8_t formN = fresh ? nearestFormation() : 0;
+  uint8_t formN = nearestFormation();
   ThreatLevel threat = classifyThreat(nearest.bearingDeg, nearest.trackDeg,
-                                      nearest.distanceKm, altFt, haveAlt, fresh,
-                                      af, fresh && nearestIsMilitary(), formN >= 2);
+                                      nearest.distanceKm, altFt, haveAlt, true,
+                                      af, nearestIsMilitary(), formN >= 2);
 
-  uint8_t wsIdx = selectWeaponSystem(af, band, fresh ? nearest.distanceKm : 0.0);
+  uint8_t wsIdx = selectWeaponSystem(af, band, nearest.distanceKm);
   WeaponSystemRecord w;
   loadWeapon(wsIdx, w);
 
-  Envelope env = classifyEnvelope(w, nearest.distanceKm, altFt, haveAlt, fresh);
+  Envelope env = classifyEnvelope(w, nearest.distanceKm, altFt, haveAlt, true);
 
   float solDeg = 0.0f;
-  bool  solOk  = fresh && calculateTrackLeadDeg(HOME_LAT, HOME_LON,
-                                                nearest.lat, nearest.lon,
-                                                nearest.trackDeg, nearest.velocityMs,
-                                                TRACK_LOOKAHEAD_SECONDS, solDeg);
+  bool  solOk  = calculateTrackLeadDeg(HOME_LAT, HOME_LON,
+                                       nearest.lat, nearest.lon,
+                                       nearest.trackDeg, nearest.velocityMs,
+                                       TRACK_LOOKAHEAD_SECONDS, solDeg);
 
   float tof = 0.0f, pk = 0.0f;
   bool  tofOk = calcInterceptSeconds(w, nearest.distanceKm, env, tof);
@@ -3177,9 +3188,8 @@ void screenWeapons() {
   // Four rows of label/value pairs, 9 px pitch.
   // Row 1: target | altitude band. A formation shows its size in place of
   // the HELI suffix ("TGT H60 x3"); the column is 13 characters.
-  const char* typ = fresh ? nearestType() : "";
-  if (!fresh)          snprintf(line, sizeof(line), "TGT ---");
-  else if (formN >= 2) snprintf(line, sizeof(line), "TGT %s x%u", typ[0] ? typ : airframeShort(af), formN);
+  const char* typ = nearestType();
+  if (formN >= 2)      snprintf(line, sizeof(line), "TGT %s x%u", typ[0] ? typ : airframeShort(af), formN);
   else if (typ[0])     snprintf(line, sizeof(line), "TGT %s%s", typ, isRotor(cat) ? " HELI" : "");
   else                 snprintf(line, sizeof(line), "TGT %s", airframeShort(af));
   u8g2.drawStr(0, 36, line);
@@ -3203,9 +3213,8 @@ void screenWeapons() {
   u8g2.drawStr(C2, 45, line);
 
   // Row 3: envelope with range over max range | time of flight
-  if (fresh) snprintf(line, sizeof(line), "ENV %s %d/%d", envelopeShort(env),
-                      (int)(nearest.distanceKm + 0.5), w.maxRangeKm);
-  else       snprintf(line, sizeof(line), "ENV --- -/%d", w.maxRangeKm);
+  snprintf(line, sizeof(line), "ENV %s %d/%d", envelopeShort(env),
+           (int)(nearest.distanceKm + 0.5), w.maxRangeKm);
   u8g2.drawStr(0, 54, line);
   if (tofOk) snprintf(line, sizeof(line), "TOF %ds", (int)(tof + 0.5f));
   else       snprintf(line, sizeof(line), "TOF ---");

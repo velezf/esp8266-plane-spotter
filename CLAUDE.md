@@ -589,6 +589,15 @@ something readable from across the room, not a plot. Do not reintroduce
 graphics here. Half-row values use the short forms (`airframeShort()`,
 `envelopeShort()`): a column is 13 characters of 5x7.
 
+**The page fails closed.** With no target, or with the feed older than
+`TRACK_STALE_MS`, `screenWeapons()` returns before selecting a system and draws
+only `NO TARGET` over `in range.` (the TARGET page's empty state) or over
+`track stale.` when a target exists but the data behind it is old. It used to
+pick a system for an UNKNOWN contact at 0 km and draw the full table around
+dashes, which on an empty sky read as a weapon assigned to nothing (seen during
+the 2026-11-13 national ground stop). Everything below the early return can
+assume a valid, fresh target; do not reintroduce per-row stale fallbacks.
+
 **Themes are ladders, not arsenals.** The Marine theme owns only MADIS and
 hands off to NASAMS and Patriot above it, because the Marines field no organic
 medium or long-range SAM; a strict filter would blank the page for most
